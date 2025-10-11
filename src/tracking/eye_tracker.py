@@ -1,5 +1,5 @@
 # src/tracking/eye_tracker.py
-# Versão 2: Implementação completa da calibração 3D e cálculo de gaze.
+# Versão 3: Adicionados os métodos save_calibration e load_calibration.
 
 import threading
 import time
@@ -12,7 +12,6 @@ import cv2
 import numpy as np
 import mediapipe as mp
 
-# Importa o núcleo refatorado
 from . import monitor_core as mc
 
 
@@ -32,7 +31,6 @@ class EyeTracker(threading.Thread):
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = None
 
-        # --- Estado interno da calibração (espelhado do script original) ---
         self.left_locked = False
         self.right_locked = False
         self.left_sphere_local_offset = None
@@ -42,17 +40,15 @@ class EyeTracker(threading.Thread):
         self.R_ref_nose = [None]
         self.base_radius = 20
 
-        # --- Estado de detecção de piscar ---
         self.blink_start_time = 0
-        self.BLINK_DURATION_THRESHOLD = 2.5  # Segundos para um clique (ajustado de 3s para mais responsividade)
+        self.BLINK_DURATION_THRESHOLD = 2.5
 
+    # ... (os métodos _compute_iris_center e _compute_ear permanecem os mesmos) ...
     def _compute_iris_center(self, landmarks, indexes):
-        """Calcula o centro da íris a partir da média dos seus landmarks."""
         points = np.array([[landmarks[i].x * mc.w, landmarks[i].y * mc.h, landmarks[i].z * mc.w] for i in indexes])
         return np.mean(points, axis=0)
 
     def _compute_ear(self, landmarks, eye_points_idxs):
-        """Calcula o Eye Aspect Ratio (EAR) para detecção de piscar."""
         try:
             eye_points = np.array([[landmarks[i].x * mc.w, landmarks[i].y * mc.h] for i in eye_points_idxs])
             A = np.linalg.norm(eye_points[1] - eye_points[5])
@@ -61,10 +57,10 @@ class EyeTracker(threading.Thread):
             ear = (A + B) / (2.0 * C)
             return ear
         except:
-            return 0.4  # Valor padrão se landmarks não estiverem disponíveis
+            return 0.4
 
     def run(self):
-        """Loop principal da thread: processa frames e atualiza o shared_state com dados de gaze."""
+        # ... (o método run permanece o mesmo) ...
         self.face_mesh = self.mp_face_mesh.FaceMesh(
             max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5, min_tracking_confidence=0.5
         )
@@ -86,22 +82,20 @@ class EyeTracker(threading.Thread):
                     frame, landmarks, mc.nose_indices, self.R_ref_nose
                 )
 
-                # --- Lógica de Detecção de Piscar Prolongado ---
-                left_ear = self._compute_ear(landmarks, [362, 385, 387, 373, 390, 263])  # Indices para olho esquerdo
-                right_ear = self._compute_ear(landmarks, [133, 160, 158, 144, 153, 33])  # Indices para olho direito
+                left_ear = self._compute_ear(landmarks, [362, 385, 387, 373, 390, 263])
+                right_ear = self._compute_ear(landmarks, [133, 160, 158, 144, 153, 33])
                 avg_ear = (left_ear + right_ear) / 2.0
 
-                if avg_ear < 0.2:  # Limiar para olho fechado
+                if avg_ear < 0.2:
                     if self.blink_start_time == 0:
                         self.blink_start_time = time.time()
                     elif (time.time() - self.blink_start_time) > self.BLINK_DURATION_THRESHOLD:
                         with self.lock:
                             self.shared_state["click_request"] = True
-                        self.blink_start_time = 0  # Reseta para evitar múltiplos cliques
+                        self.blink_start_time = 0
                 else:
                     self.blink_start_time = 0
 
-                # --- Cálculo de Gaze 3D (APENAS SE CALIBRADO) ---
                 if self.left_locked and self.right_locked:
                     iris_left_3d = self._compute_iris_center(landmarks, self.LEFT_IRIS_INDEXES)
                     iris_right_3d = self._compute_iris_center(landmarks, self.RIGHT_IRIS_INDEXES)
@@ -132,7 +126,7 @@ class EyeTracker(threading.Thread):
         self.stop()
 
     def start_debug_window(self):
-        """Abre a janela de debug bloqueante para calibração, com todas as funcionalidades."""
+        # ... (o método start_debug_window permanece o mesmo) ...
         if not self.cap or not self.cap.isOpened():
             self.cap = cv2.VideoCapture(self.camera_index)
 
@@ -149,7 +143,6 @@ class EyeTracker(threading.Thread):
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = self.face_mesh.process(rgb)
 
-            # Zera variáveis para este quadro
             head_center, R_final, all_landmarks_3d, combined_dir = None, None, None, None
             sphere_world_l, sphere_world_r, iris_left_3d, iris_right_3d = None, None, None, None
             scaled_radius_l, scaled_radius_r = None, None
@@ -222,6 +215,78 @@ class EyeTracker(threading.Thread):
 
         cv2.destroyAllWindows()
 
+    # --- NOVOS MÉTODOS ADICIONADOS ---
+
+    def save_calibration(self):
+        """
+        Coleta todos os dados de calibração da instância atual e do módulo monitor_core
+        e os retorna como um dicionário pronto para ser salvo como JSON.
+        """
+        if not (self.left_locked and self.right_locked):
+            print("AVISO: Tentando salvar calibração sem estar calibrado.")
+            return None
+
+        # Converte arrays numpy para listas para serialização JSON
+        def to_list(arr):
+            return arr.tolist() if isinstance(arr, np.ndarray) else arr
+
+        calib_data = {
+            "calibration_date": datetime.utcnow().isoformat() + "Z",
+            "camera_index": self.camera_index,
+            "calibration_offsets": {
+                "yaw": mc.calibration_offset_yaw,
+                "pitch": mc.calibration_offset_pitch
+            },
+            "monitor_plane": {
+                "corners": to_list(mc.monitor_corners),
+                "center": to_list(mc.monitor_center_w),
+                "normal": to_list(mc.monitor_normal_w),
+                "units_per_cm": mc.units_per_cm
+            },
+            "left_sphere_local_offset": to_list(self.left_sphere_local_offset),
+            "right_sphere_local_offset": to_list(self.right_sphere_local_offset),
+            "left_calibration_nose_scale": self.left_calibration_nose_scale,
+            "right_calibration_nose_scale": self.right_calibration_nose_scale,
+        }
+        return calib_data
+
+    def load_calibration(self, calib_data: dict):
+        """
+
+        Carrega os dados de calibração de um dicionário (lido do JSON)
+        e popula o estado interno do tracker e do monitor_core.
+        """
+        try:
+            # Carrega offsets
+            offsets = calib_data["calibration_offsets"]
+            mc.calibration_offset_yaw = offsets["yaw"]
+            mc.calibration_offset_pitch = offsets["pitch"]
+
+            # Carrega plano do monitor
+            plane = calib_data["monitor_plane"]
+            mc.monitor_corners = np.array(plane["corners"])
+            mc.monitor_center_w = np.array(plane["center"])
+            mc.monitor_normal_w = np.array(plane["normal"])
+            mc.units_per_cm = plane["units_per_cm"]
+
+            # Carrega dados das esferas oculares
+            self.left_sphere_local_offset = np.array(calib_data["left_sphere_local_offset"])
+            self.right_sphere_local_offset = np.array(calib_data["right_sphere_local_offset"])
+            self.left_calibration_nose_scale = calib_data["left_calibration_nose_scale"]
+            self.right_calibration_nose_scale = calib_data["right_calibration_nose_scale"]
+
+            self.left_locked = self.right_locked = True
+
+            print("Dados de calibração carregados com sucesso no tracker.")
+            return True
+        except KeyError as e:
+            print(f"ERRO: Chave ausente no arquivo de calibração: {e}")
+            return False
+        except Exception as e:
+            print(f"ERRO ao carregar dados de calibração: {e}")
+            return False
+
+    # --- Métodos de controle da thread ---
     def start(self):
         """Inicia a thread de rastreamento em segundo plano."""
         self.running = True

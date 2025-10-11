@@ -9,6 +9,8 @@ import sys
 import shutil
 from PIL import Image, ImageTk
 import pyautogui
+from tracking import calibration
+from tkinter import simpledialog
 
 from tracking.eye_tracker import EyeTracker
 
@@ -50,7 +52,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Assistente de Acessibilidade Ocular")
-        self.geometry("1280x720")
+        # Inicia a aplicação em tela cheia, como solicitado
+        self.attributes('-fullscreen', True)
 
         self.tracker = None
         self.shared_state = {"_lock": threading.Lock()}
@@ -61,7 +64,7 @@ class App(tk.Tk):
 
         self.create_calibrator_view()
 
-    # --- Tela de Calibração ---
+    # --- TELA DE CALIBRAÇÃO E PERFIS (ATUALIZADA) ---
     def create_calibrator_view(self):
         for widget in self.winfo_children():
             widget.destroy()
@@ -70,29 +73,70 @@ class App(tk.Tk):
         frame = tk.Frame(self, bg="#222")
         frame.pack(expand=True)
 
-        tk.Label(frame, text="Selecione a Câmera e Calibre", font=("Arial", 26, "bold"), bg="#222", fg="white").pack(pady=30)
+        tk.Label(frame, text="Selecione um Perfil ou Crie um Novo", font=("Arial", 26, "bold"), bg="#222",
+                 fg="white").pack(pady=30)
 
+        # --- Listagem de Perfis Existentes ---
+        profiles = calibration.list_profiles()
+        if profiles:
+            tk.Label(frame, text="Carregar Perfil Existente:", font=("Arial", 16), bg="#222", fg="white").pack(
+                pady=(20, 5))
+            self.profile_var = tk.StringVar(self)
+            self.profile_var.set(profiles[0])
+            tk.OptionMenu(frame, self.profile_var, *profiles).pack(pady=10)
+            tk.Button(frame, text="Carregar Perfil", font=("Arial", 18), command=self.load_profile_and_start).pack(
+                pady=20)
+
+        # --- Opção para Criar Novo Perfil ---
+        tk.Label(frame, text="Ou crie um novo perfil:", font=("Arial", 16), bg="#222", fg="white").pack(
+            pady=(40, 5))
         self.camera_var = tk.StringVar(self)
         self.camera_var.set("Câmera 0")
         tk.OptionMenu(frame, self.camera_var, "Câmera 0", "Câmera 1").pack(pady=10)
+        tk.Button(frame, text="Criar Novo Perfil e Calibrar", font=("Arial", 18),
+                  command=self.run_calibration).pack(pady=20)
 
-        tk.Button(frame, text="Iniciar Calibração", font=("Arial", 18), command=self.run_calibration).pack(pady=40)
+    def load_profile_and_start(self):
+        """Carrega um perfil de calibração e inicia o tracker."""
+        profile_name = self.profile_var.get()
+        calib_data = calibration.load_profile(profile_name)
+
+        if not calib_data:
+            messagebox.showerror("Erro", f"Não foi possível carregar o perfil '{profile_name}'.")
+            return
+
+        camera_index = calib_data.get("camera_index", 0)
+
+        self.tracker = EyeTracker(camera_index=camera_index, shared_state=self.shared_state)
+        self.tracker.load_calibration(calib_data)  # Carrega os dados no tracker
+        self.tracker.start()  # Inicia o tracker em segundo plano
+
+        self.create_dashboard()
 
     def run_calibration(self):
-        """Inicia o EyeTracker e abre a janela de calibração."""
+        """Inicia o EyeTracker, abre a janela de calibração e salva um novo perfil."""
+        profile_name = simpledialog.askstring("Novo Perfil",
+                                              "Digite um nome para o novo perfil (ex: Matheus - Casa, Mesa de Jantar):")
+        if not profile_name:
+            return  # Usuário cancelou
+
         camera_index = int(self.camera_var.get().split()[-1])
 
         messagebox.showinfo(
             "Instruções de Calibração",
-            "1. Olhe para o centro da tela e pressione 'C' para travar o monitor.\n"
-            "2. Pressione 'S' para calibrar o centro do olhar.\n"
+            "1. Olhe para o centro da tela e pressione 'C'.\n"
+            "2. Olhe para o centro novamente e pressione 'S'.\n"
             "3. Pressione 'Q' para fechar a janela quando terminar."
         )
 
         self.tracker = EyeTracker(camera_index=camera_index, shared_state=self.shared_state)
-        self.tracker.start_debug_window()
-        self.tracker.start()
+        self.tracker.start_debug_window()  # Executa a calibração
 
+        # Após a calibração, salva os dados no novo perfil
+        calib_data = self.tracker.save_calibration()  # Obtém os dados
+        calibration.save_profile(profile_name, calib_data)  # Salva no arquivo
+
+        self.tracker.start()  # Inicia o tracker em segundo plano
         self.create_dashboard()
 
     def create_dashboard(self):
