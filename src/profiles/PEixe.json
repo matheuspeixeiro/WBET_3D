@@ -1,0 +1,10 @@
+{
+    "calibration_date": "2025-10-11T18:12:50.256330Z",
+    "camera_index": 0,
+    "calibration_offsets": {
+        "yaw": -2.7012159438600305,
+        "pitch": -2.122659760481781
+    },
+    "monitor_plane": {
+        "corners": [
+            

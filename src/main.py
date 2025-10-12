@@ -239,17 +239,26 @@ class App(tk.Tk):
             self.currently_snapped_widget = None
 
     def update_loop(self):
+        """Loop principal da GUI: gerencia o snap e os cliques, agora com lógica de congelamento."""
         if self.mouse_control_enabled and self.tracker:
-            gaze_data = self.tracker.get_screen_gaze()
+
+            with self.lock:
+                is_frozen = self.shared_state.get("gaze_frozen", False)
+                if is_frozen:
+                    gaze_data = self.shared_state.get("frozen_gaze_coords")
+                else:
+                    gaze_data = self.tracker.get_screen_gaze()
 
             if gaze_data:
                 gaze_x, gaze_y, _, _, _ = gaze_data
+
+                # A lógica de snap e movimento do mouse agora opera com a posição (congelada ou não)
                 min_dist_sq = float("inf")
                 closest_widget = None
 
                 for widget in self.focusable_widgets:
-                    if not widget.winfo_exists():
-                        continue
+                    if not widget.winfo_exists(): continue
+
                     x, y, w, h = widget.winfo_rootx(), widget.winfo_rooty(), widget.winfo_width(), widget.winfo_height()
                     center_x, center_y = x + w / 2, y + h / 2
                     dist_sq = (gaze_x - center_x) ** 2 + (gaze_y - center_y) ** 2
@@ -261,19 +270,22 @@ class App(tk.Tk):
                 min_dist = min_dist_sq ** 0.5
 
                 if closest_widget and min_dist <= SNAP_THRESHOLD_PIXELS:
+                    # Se está na zona de snap, o cursor fica travado no centro do widget
                     if closest_widget != self.currently_snapped_widget:
                         target_x = closest_widget.winfo_rootx() + closest_widget.winfo_width() / 2
                         target_y = closest_widget.winfo_rooty() + closest_widget.winfo_height() / 2
                         pyautogui.moveTo(target_x, target_y, duration=0.1)
                         self.currently_snapped_widget = closest_widget
                 else:
-                    pyautogui.moveTo(gaze_x, gaze_y, duration=0.1)
+                    # Fora da zona de snap
+                    if not is_frozen:  # Só move o cursor se não estiver congelado
+                        pyautogui.moveTo(gaze_x, gaze_y, duration=0.1)
                     self.currently_snapped_widget = None
 
-                with self.shared_state["_lock"]:
+                # --- Lógica de Clique por Piscar ---
+                with self.lock:
                     click_request = self.shared_state.get("click_request", False)
-                    if click_request:
-                        self.shared_state["click_request"] = False
+                    if click_request: self.shared_state["click_request"] = False
 
                 if click_request and self.currently_snapped_widget:
                     print(f"CLIQUE ocular em: {self.currently_snapped_widget.cget('text')}")

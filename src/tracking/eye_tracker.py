@@ -1,23 +1,28 @@
 # src/tracking/eye_tracker.py
-# Versão 3: Adicionados os métodos save_calibration e load_calibration.
+# Versão 4: Lógica de clique refinada com "pré-trava" no início do piscar.
 
 import threading
 import time
 import json
-import math
 import os
 from datetime import datetime
-
 import cv2
 import numpy as np
 import mediapipe as mp
-
 from . import monitor_core as mc
 
 
 class EyeTracker(threading.Thread):
+    # --- CONSTANTES ---
     LEFT_IRIS_INDEXES = [474, 475, 476, 477]
     RIGHT_IRIS_INDEXES = [469, 470, 471, 472]
+    LEFT_EYE_OUTLINE_IDX = [362, 385, 387, 263, 390, 373]  # Para EAR
+    RIGHT_EYE_OUTLINE_IDX = [133, 160, 158, 33, 153, 144]  # Para EAR
+
+    # --- NOVAS CONSTANTES E ESTADOS PARA PISCAR ---
+    EAR_THRESHOLD = 0.2  # Limiar para considerar o olho fechado
+    BLINK_PRE_LOCK_TIME = 0.1  # Tempo mínimo com olho fechado para ativar a pré-trava
+    BLINK_CLICK_DURATION = 3.0  # Duração para confirmar o clique
 
     def __init__(self, camera_index: int = 0, shared_state: dict = None):
         super().__init__(daemon=True, name="EyeTrackerThread")
@@ -31,19 +36,22 @@ class EyeTracker(threading.Thread):
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = None
 
+        # Estado da calibração
         self.left_locked = False
         self.right_locked = False
         self.left_sphere_local_offset = None
+        # ... (demais variáveis de calibração)
         self.right_sphere_local_offset = None
         self.left_calibration_nose_scale = None
         self.right_calibration_nose_scale = None
         self.R_ref_nose = [None]
         self.base_radius = 20
 
-        self.blink_start_time = 0
-        self.BLINK_DURATION_THRESHOLD = 2.5
+        # Máquina de estados para o piscar
+        self.blink_state = "IDLE"  # "IDLE", "PRE_LOCKED"
+        self.blink_state_start_time = 0
 
-    # ... (os métodos _compute_iris_center e _compute_ear permanecem os mesmos) ...
+    # ... (métodos _compute_iris_center e _compute_ear permanecem os mesmos) ...
     def _compute_iris_center(self, landmarks, indexes):
         points = np.array([[landmarks[i].x * mc.w, landmarks[i].y * mc.h, landmarks[i].z * mc.w] for i in indexes])
         return np.mean(points, axis=0)
@@ -60,14 +68,12 @@ class EyeTracker(threading.Thread):
             return 0.4
 
     def run(self):
-        # ... (o método run permanece o mesmo) ...
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5, min_tracking_confidence=0.5
-        )
-        if not self.cap or not self.cap.isOpened():
-            self.cap = cv2.VideoCapture(self.camera_index)
-
+        # ... (inicialização do método run permanece a mesma) ...
+        self.face_mesh = self.mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True)
+        if not self.cap or not self.cap.isOpened(): self.cap = cv2.VideoCapture(self.camera_index)
         mc.w, mc.h = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        last_valid_gaze = None
 
         while self.running:
             ret, frame = self.cap.read()
@@ -76,53 +82,68 @@ class EyeTracker(threading.Thread):
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = self.face_mesh.process(rgb)
 
+            gaze_is_valid = False
             if results.multi_face_landmarks:
                 landmarks = results.multi_face_landmarks[0].landmark
-                head_center, R_final, nose_points_3d = mc.compute_and_draw_coordinate_box(
-                    frame, landmarks, mc.nose_indices, self.R_ref_nose
-                )
-
-                left_ear = self._compute_ear(landmarks, [362, 385, 387, 373, 390, 263])
-                right_ear = self._compute_ear(landmarks, [133, 160, 158, 144, 153, 33])
-                avg_ear = (left_ear + right_ear) / 2.0
-
-                if avg_ear < 0.2:
-                    if self.blink_start_time == 0:
-                        self.blink_start_time = time.time()
-                    elif (time.time() - self.blink_start_time) > self.BLINK_DURATION_THRESHOLD:
-                        with self.lock:
-                            self.shared_state["click_request"] = True
-                        self.blink_start_time = 0
-                else:
-                    self.blink_start_time = 0
+                head_center, R_final, nose_points_3d = mc.compute_and_draw_coordinate_box(frame, landmarks,
+                                                                                          mc.nose_indices,
+                                                                                          self.R_ref_nose)
 
                 if self.left_locked and self.right_locked:
+                    # Cálculo de gaze 3D...
                     iris_left_3d = self._compute_iris_center(landmarks, self.LEFT_IRIS_INDEXES)
                     iris_right_3d = self._compute_iris_center(landmarks, self.RIGHT_IRIS_INDEXES)
-
                     current_nose_scale = mc.compute_scale(nose_points_3d)
                     scale_ratio_l = current_nose_scale / self.left_calibration_nose_scale
                     scale_ratio_r = current_nose_scale / self.right_calibration_nose_scale
-
                     sphere_world_l = head_center + R_final @ (self.left_sphere_local_offset * scale_ratio_l)
                     sphere_world_r = head_center + R_final @ (self.right_sphere_local_offset * scale_ratio_r)
-
                     left_dir = mc._normalize(iris_left_3d - sphere_world_l)
                     right_dir = mc._normalize(iris_right_3d - sphere_world_r)
                     combined_dir = mc._normalize((left_dir + right_dir) / 2.0)
-
                     mc.combined_gaze_directions.append(combined_dir)
                     avg_gaze_dir = mc._normalize(np.mean(mc.combined_gaze_directions, axis=0))
+                    screen_x, screen_y, raw_yaw, raw_pitch = mc.convert_gaze_to_screen_coordinates(avg_gaze_dir,
+                                                                                                   mc.calibration_offset_yaw,
+                                                                                                   mc.calibration_offset_pitch)
 
-                    screen_x, screen_y, raw_yaw, raw_pitch = mc.convert_gaze_to_screen_coordinates(
-                        avg_gaze_dir, mc.calibration_offset_yaw, mc.calibration_offset_pitch
-                    )
+                    last_valid_gaze = (screen_x, screen_y, raw_yaw, raw_pitch, 1.0)
+                    gaze_is_valid = True
 
-                    with self.lock:
-                        self.shared_state['gaze'] = (screen_x, screen_y, raw_yaw, raw_pitch, 1.0)
+                # --- NOVA LÓGICA DE PISCAR DE DOIS ESTÁGIOS ---
+                left_ear = self._compute_ear(landmarks, self.LEFT_EYE_OUTLINE_IDX)
+                right_ear = self._compute_ear(landmarks, self.RIGHT_EYE_OUTLINE_IDX)
+                avg_ear = (left_ear + right_ear) / 2.0
+
+                is_blinking = avg_ear < self.EAR_THRESHOLD
+
+                if self.blink_state == "IDLE":
+                    if is_blinking:
+                        self.blink_state = "PRE_LOCKED"
+                        self.blink_state_start_time = time.time()
+                        with self.lock:
+                            # Congela a posição do olhar no último ponto válido
+                            self.shared_state["gaze_frozen"] = True
+                            if last_valid_gaze:
+                                self.shared_state["frozen_gaze_coords"] = last_valid_gaze
+
+                elif self.blink_state == "PRE_LOCKED":
+                    if not is_blinking:  # Olhos abriram antes do tempo
+                        self.blink_state = "IDLE"
+                        with self.lock:
+                            self.shared_state["gaze_frozen"] = False  # Descongela
+                    elif (time.time() - self.blink_state_start_time) > self.BLINK_CLICK_DURATION:
+                        # Piscar longo confirmado!
+                        with self.lock:
+                            self.shared_state["click_request"] = True
+                            self.shared_state["gaze_frozen"] = False  # Descongela após o clique
+                        self.blink_state = "IDLE"  # Reseta o estado
+
+            if gaze_is_valid:
+                with self.lock:
+                    self.shared_state['gaze'] = last_valid_gaze
 
             time.sleep(0.001)
-
         self.stop()
 
     def start_debug_window(self):
@@ -219,16 +240,18 @@ class EyeTracker(threading.Thread):
 
     def save_calibration(self):
         """
-        Coleta todos os dados de calibração da instância atual e do módulo monitor_core
-        e os retorna como um dicionário pronto para ser salvo como JSON.
+        Coleta todos os dados de calibração e os retorna como um dicionário
+        pronto para ser salvo como JSON, com conversão de ndarray para lista.
         """
         if not (self.left_locked and self.right_locked):
             print("AVISO: Tentando salvar calibração sem estar calibrado.")
             return None
 
-        # Converte arrays numpy para listas para serialização JSON
-        def to_list(arr):
-            return arr.tolist() if isinstance(arr, np.ndarray) else arr
+        # Função auxiliar para garantir que tudo seja serializável
+        def to_list_safe(item):
+            if isinstance(item, np.ndarray):
+                return item.tolist()
+            return item
 
         calib_data = {
             "calibration_date": datetime.utcnow().isoformat() + "Z",
@@ -238,13 +261,13 @@ class EyeTracker(threading.Thread):
                 "pitch": mc.calibration_offset_pitch
             },
             "monitor_plane": {
-                "corners": to_list(mc.monitor_corners),
-                "center": to_list(mc.monitor_center_w),
-                "normal": to_list(mc.monitor_normal_w),
+                "corners": to_list_safe(mc.monitor_corners),
+                "center": to_list_safe(mc.monitor_center_w),
+                "normal": to_list_safe(mc.monitor_normal_w),
                 "units_per_cm": mc.units_per_cm
             },
-            "left_sphere_local_offset": to_list(self.left_sphere_local_offset),
-            "right_sphere_local_offset": to_list(self.right_sphere_local_offset),
+            "left_sphere_local_offset": to_list_safe(self.left_sphere_local_offset),
+            "right_sphere_local_offset": to_list_safe(self.right_sphere_local_offset),
             "left_calibration_nose_scale": self.left_calibration_nose_scale,
             "right_calibration_nose_scale": self.right_calibration_nose_scale,
         }
