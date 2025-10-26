@@ -41,7 +41,7 @@ A motivação principal é oferecer uma alternativa **acessível e de baixo cust
 
 ## 🧮 Como Funciona: Rastreamento 3D
 
-Diferente dos rastreadores 2D que apenas mapeiam a posição da pupila, este projeto implementa um **modelo 3D de rastreamento ocular**, garantindo **precisão milimétrica**.
+Diferente dos rastreadores 2D que apenas mapeiam a posição da pupila, este projeto implementa um **modelo 3D de rastreamento ocular**, garantindo maior precisão.
 
 ### Etapas Técnicas
 
@@ -52,7 +52,7 @@ Diferente dos rastreadores 2D que apenas mapeiam a posição da pupila, este pro
    Esses marcos são usados para estimar a pose 3D da cabeça, obtendo origem (centro do olho) e direção do olhar (vetor).
 
 3. **Calibração do Monitor:**  
-   Durante a calibração, o usuário olha para pontos específicos.  
+   Durante a calibração, o usuário olha para o centro da tela.  
    O sistema coleta vetores do olhar e calcula o **plano virtual do monitor** no espaço 3D.
 
 4. **Intersecção em Tempo Real:**  
