@@ -1,11 +1,3 @@
-# monitor_core.py
-# Core monitor / gaze utilities extracted from MonitorTracking.py
-# (keeps original function names so existing calls won't break)
-#
-# Based on user's MonitorTracking.py (extracted functions and helpers).
-# See original for interactive loop / camera capture / main program.
-# Citation: MonitorTracking.py from the user's project. :contentReference[oaicite:1]{index=1}
-
 import cv2
 import numpy as np
 import math
@@ -79,7 +71,7 @@ nose_indices = [4, 45, 275, 220, 440, 1, 5, 51, 281, 44, 274, 241,
                 3, 248]
 
 # File for writing screen position (kept name)
-screen_position_file = "screen_position.txt"
+screen_position_file = "tracking/screen_position.txt"
 
 
 def write_screen_position(x, y):
