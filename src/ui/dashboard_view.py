@@ -1,4 +1,4 @@
-# src/ui/dashboard.py
+# src/ui/dashboard_view.py
 import tkinter as tk
 from PIL import Image, ImageTk
 
