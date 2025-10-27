@@ -79,8 +79,7 @@ Diferente dos rastreadores 2D que apenas mapeiam a posição da pupila, este pro
 
 ```bash
 # Clone o repositório
-git clone https://github.com/seu-usuario/Gaze-Based-Computer-Control.git
-cd Gaze-Based-Computer-Control
+git clone https://github.com/matheuspeixeiro/WBET_3D.git
 
 # (Opcional) Crie e ative um ambiente virtual
 python3 -m venv venv
