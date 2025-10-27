@@ -20,6 +20,7 @@ import pyautogui
 import screeninfo
 import cv2
 import time
+from ui.dashboard import DashboardFrame
 import os
 
 from tracking.eye_tracker import EyeTracker
@@ -31,81 +32,6 @@ PREVIEW_SIZE = (320, 240)
 GAZE_MOVE_DELAY = 5  # segundos de atraso no movimento do cursor
 GAZE_STABILITY_DELAY = 1.5  # <--- ADICIONE ESTA LINHA
 GAZE_TOLERANCE_PX = 80
-
-# --- Funções Auxiliares (Apps) ---
-def abrir_bloco_de_notas(app_instance):
-    """Abre um editor de texto simples, com fallback para Tkinter, no monitor ativo."""
-    try:
-        if sys.platform.startswith("darwin"):
-            subprocess.Popen(["open", "-a", "TextEdit"])
-            return
-        elif sys.platform.startswith("win"):
-            subprocess.Popen(["notepad.exe"])
-            return
-        else:
-            for editor in ["gedit", "xed", "kate", "mousepad"]:
-                if shutil.which(editor):
-                    subprocess.Popen([editor])
-                    return
-    except Exception:
-        pass
-
-    # --- Fallback integrado ---
-    editor = tk.Toplevel(app_instance)
-    editor.title("Bloco de Notas Interno")
-    text_area = tk.Text(editor, wrap="word", font=("Arial", 14))
-    text_area.pack(expand=True, fill="both")
-    # Posiciona no monitor ativo
-    mon = app_instance.get_active_monitor()
-    editor.geometry(f"800x600+{mon.x + 60}+{mon.y + 60}")
-    editor.transient(app_instance)
-
-
-def abrir_configuracoes(app_instance):
-    config = tk.Toplevel(app_instance)
-    config.title("Configurações")
-    config.configure(bg="#222")
-    config.resizable(False, False)
-    tk.Label(config, text="Configurações", font=("Arial", 16, "bold"), bg="#222", fg="white").pack(pady=20)
-    tk.Button(config, text="Trocar ou Gerenciar Perfis", command=app_instance.create_calibrator_view).pack(pady=10)
-    tk.Button(config, text="Fechar", command=config.destroy).pack(pady=20)
-    # Posiciona no monitor ativo
-    mon = app_instance.get_active_monitor()
-    config.geometry(f"400x300+{mon.x + 100}+{mon.y + 100}")
-    config.transient(app_instance)
-
-def _criar_tile(parent, image_path=None, command=None, border="#0b4073"):
-    """
-    Cria um 'tile' grande (quadrado/retângulo) de dashboard.
-    - Se command for None: o tile é 'inert' (slot vazio).
-    - Se image_path existir: ícone centralizado grande.
-    Retorna o widget 'superfície' que entra em focusable_widgets.
-    """
-    cont = tk.Frame(parent, bg="#ffffff", highlightthickness=3, highlightbackground=border)
-    # Superfície clicável (Button se funcional, Label se slot vazio)
-    surface_kwargs = dict(bg="#ffffff", activebackground="#f2f6ff", bd=0, relief="flat")
-    if command:
-        surface = tk.Button(cont, **surface_kwargs, command=command)
-    else:
-        surface = tk.Label(cont, **surface_kwargs)
-
-    surface.pack(expand=True, fill="both", padx=12, pady=12)
-
-    # Ícone central
-    if image_path:
-        try:
-            img = Image.open(image_path)
-            # tamanho alvo grande mas seguro (ajustável)
-            img = img.resize((220, 220))
-            icon = ImageTk.PhotoImage(img)
-            # guardamos referência pra não ser coletado
-            surface._icon_ref = icon
-            surface.configure(image=icon, compound="center")
-        except Exception:
-            # se der erro no ícone, deixamos só o bloco branco
-            pass
-
-    return cont, surface
 
 # --- CLASSE PRINCIPAL ---
 class App(tk.Tk):
@@ -127,9 +53,13 @@ class App(tk.Tk):
         self.shared_state = {"_lock": threading.RLock()}  # RLock evita deadlocks
         self.mouse_control_enabled = False
         self.focusable_widgets = []
+
         self.currently_snapped_widget = None
         self.selected_monitor_index = 0
         self.default_camera_index = 0
+        self.current_screen = None
+        self._update_loop_job = None
+        self._modal_widget_backup = []
 
         # Monitores (com fallback)
         self.available_monitors = self._get_monitores_com_fallback()
@@ -145,6 +75,28 @@ class App(tk.Tk):
         self._preview_job = None
         self._calib_cap = None
         self._calib_job = None
+
+        # --- Estado do preview contínuo ---
+        self._preview_cap = None
+        self._preview_job = None
+        self._calib_cap = None
+        self._calib_job = None
+
+        # --- Estado do Bloco de Notas ---
+        self.notepad_text_widget = None
+        self.sticky_shift_active = False
+        self.caps_lock_active = False
+        self.notepad_is_dirty = False
+        self.notepad_last_save_content = ""
+        self.notepad_save_dir = os.path.join(os.path.expanduser("~"), "Documentos", "SimpleEyeTracker")
+
+        # --- Referências de Ícones (carregar no __init__ para reuso) ---
+        self.icon_home = None
+        self.icon_notepad = None
+        self._load_sidebar_icons()
+
+        # Tela inicial no root (sem Toplevel/withdraw) — base funcional
+        self._build_startup_frame()
 
         # Tela inicial no root (sem Toplevel/withdraw) — base funcional
         self._build_startup_frame()
@@ -302,6 +254,327 @@ class App(tk.Tk):
         self.move_root_to_monitor(self.selected_monitor_index)
         self.create_calibrator_view()
 
+    def abrir_configuracoes_view(self):
+        """Versão de 'abrir_configuracoes' como um método da classe."""
+        config = tk.Toplevel(self)
+        config.title("Configurações")
+        config.configure(bg="#222")
+        config.resizable(False, False)
+        tk.Label(config, text="Configurações", font=("Arial", 16, "bold"), bg="#222", fg="white").pack(pady=20)
+        # Note a mudança aqui: chama o método do self (App)
+        tk.Button(config, text="Trocar ou Gerenciar Perfis", command=self.create_calibrator_view).pack(pady=10)
+        tk.Button(config, text="Fechar", command=config.destroy).pack(pady=20)
+        # Posiciona no monitor ativo
+        mon = self.get_active_monitor()
+        config.geometry(f"400x300+{mon.x + 100}+{mon.y + 100}")
+        config.transient(self)
+
+    def create_notepad_view(self):
+        """Cria a UI principal do editor de texto e teclado virtual."""
+        self._clear_root()
+        self.title("Bloco de Notas - Controle Ocular")
+        cor_fundo = "#0b4073"  # Azul-escuro padrão
+        self.configure(bg=cor_fundo)
+
+        # --- Layout Principal ---
+        main_frame = tk.Frame(self, bg=cor_fundo)
+        main_frame.pack(fill="both", expand=True)
+
+        # 1. Barra Lateral (Esquerda)
+        sidebar_frame = tk.Frame(main_frame, bg="#083057", width=100)
+        sidebar_frame.pack(side="left", fill="y", padx=(10, 0), pady=10)
+        sidebar_frame.pack_propagate(False)  # Impede que os botões encolham a barra
+
+        # 2. Área de Conteúdo (Direita)
+        content_frame = tk.Frame(main_frame, bg=cor_fundo)
+        content_frame.pack(side="left", fill="both", expand=True, padx=20, pady=10)
+
+        # --- 1. Povoar Barra Lateral ---
+        self._build_notepad_sidebar(sidebar_frame)
+
+        # --- 2. Povoar Área de Conteúdo ---
+        # 2a. Header (Botões Salvar/Novo)
+        header_frame = tk.Frame(content_frame, bg=cor_fundo)
+        header_frame.pack(fill="x", pady=(0, 10))
+
+        btn_novo = tk.Button(header_frame, text="Novo Documento", font=("Arial", 16),
+                             command=self._handle_new_document)
+        btn_novo.pack(side="left", padx=10)
+
+        btn_salvar = tk.Button(header_frame, text="Salvar", font=("Arial", 16),
+                               command=self._handle_save_document)
+        btn_salvar.pack(side="right", padx=10)
+
+        self.focusable_widgets.extend([btn_novo, btn_salvar])
+
+        # 2b. Área de Texto
+        text_frame = tk.Frame(content_frame, bg="white", borderwidth=2, relief="solid")
+        text_frame.pack(fill="both", expand=True)
+
+        self.notepad_text_widget = tk.Text(text_frame, wrap="word", font=("Arial", 20),
+                                           undo=True, bg="white", fg="black",
+                                           insertbackground="black", relief="flat")
+        self.notepad_text_widget.pack(fill="both", expand=True, padx=10, pady=10)
+        self.focusable_widgets.append(self.notepad_text_widget)
+
+        # Preenche com o conteúdo "não salvo" se estivermos apenas recarregando
+        if self.notepad_last_save_content and self.notepad_is_dirty:
+            self.notepad_text_widget.insert("1.0", self.notepad_last_save_content)
+        else:
+            self.notepad_last_save_content = ""  # Limpa para um novo doc
+
+        # Rastreia alterações
+        self.notepad_text_widget.bind("<<Modified>>", self._on_notepad_modified)
+
+        # 2c. Teclado Virtual
+        keyboard_frame = tk.Frame(content_frame, bg=cor_fundo, pady=10)
+        keyboard_frame.pack(fill="x", side="bottom")
+        self._build_virtual_keyboard(keyboard_frame)
+
+        # --- 3. Barra de Status (Inferior) ---
+        bottom_bar = tk.Frame(self, bg=cor_fundo)
+        bottom_bar.pack(fill="x", pady=(0, 16))
+
+        self.notepad_status_label = tk.Label(
+            bottom_bar,
+            text="Eye Tracking: DESATIVADO (Pressione F7)",
+            font=("Poppins", 16, "bold"), bg=cor_fundo, fg="white"
+        )
+        self.notepad_status_label.pack(side="right", padx=20)
+        # Atualiza o status caso já esteja ativo
+        self._update_status_label()
+
+        # --- 4. Bindings e Loop ---
+        self.bind("<F7>", self.toggle_mouse_control)
+        self.protocol("WM_DELETE_WINDOW", self.quit_app)
+        self.move_root_to_monitor()
+        self.update_loop()
+
+        # Foca o widget de texto por padrão
+        self.notepad_text_widget.focus_set()
+
+    def _build_notepad_sidebar(self, parent_frame):
+        """Cria os botões da barra lateral para o notepad."""
+
+        # Botão CASA (Voltar ao Dashboard)
+        btn_home = tk.Button(parent_frame, image=self.icon_home, bg="#0b4073",
+                             activebackground="#115a9e", relief="flat", borderwidth=0,
+                             command=self.create_dashboard)  # Volta ao dashboard
+        btn_home.pack(pady=(300, 20), fill="x", padx=10)
+
+        # Botão NOTEPAD (Ativo)
+        btn_notepad = tk.Button(parent_frame, image=self.icon_notepad, bg="#1E88E5",  # Cor de destaque
+                                relief="flat", borderwidth=0, state="disabled")  # Desabilitado
+        btn_notepad.pack(pady=10, fill="x", padx=10)
+
+        self.focusable_widgets.append(btn_home)
+        # Não adicionamos o btn_notepad por estar desabilitado
+
+    def _build_virtual_keyboard(self, parent_frame):
+        """Cria e exibe o teclado virtual."""
+
+        key_style = {"font": ("Arial", 16), "bg": "#333", "fg": "white",
+                     "activebackground": "#555", "activeforeground": "white",
+                     "relief": "solid", "borderwidth": 1, "width": 4, "height": 1,
+                     "padx": 5, "pady": 5}
+
+        # Layout das teclas (QWERTY)
+        key_rows = [
+            ['`', '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 'Backspace'],
+            ['Tab', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\\'],
+            ['Caps', 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', "'", 'Enter'],
+            ['Shift', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 'Shift'],
+            ['Space']
+        ]
+
+        for r_idx, row in enumerate(key_rows):
+            row_frame = tk.Frame(parent_frame, bg=parent_frame.cget("bg"))
+            row_frame.pack()
+
+            for key_char in row:
+                btn = tk.Button(row_frame, text=key_char, **key_style)
+
+                # --- Lógica de Comando ---
+                # A função lambda captura o valor de key_char no momento da criação
+                cmd = lambda char=key_char: self._on_key_press(char)
+                btn.configure(command=cmd)
+
+                # --- Lógica de Tamanho ---
+                if key_char == 'Space':
+                    btn.configure(width=60)
+                elif key_char in ['Backspace', 'Enter', 'Shift', 'Caps', 'Tab']:
+                    btn.configure(width=8, bg="#555")  # Destaque para teclas especiais
+
+                btn.pack(side="left", padx=2, pady=2)
+                self.focusable_widgets.append(btn)
+
+                # Guarda referência dos botões de estado
+                if key_char == 'Shift':
+                    self.shift_btn_ref = btn
+                if key_char == 'Caps':
+                    self.caps_btn_ref = btn
+
+    def _on_key_press(self, key_char):
+        """Lida com todos os cliques do teclado virtual."""
+        if not self.notepad_text_widget:
+            return
+
+        widget = self.notepad_text_widget
+
+        # 1. Teclas de Controle
+        if key_char == 'Backspace':
+            # Deleta o caractere antes do cursor
+            widget.delete(tk.INSERT + "-1c", tk.INSERT)
+        elif key_char == 'Enter':
+            widget.insert(tk.INSERT, '\n')
+        elif key_char == 'Tab':
+            widget.insert(tk.INSERT, '\t')
+        elif key_char == 'Space':
+            widget.insert(tk.INSERT, ' ')
+
+        # 2. Teclas Modificadoras (Sticky)
+        elif key_char == 'Shift':
+            self.sticky_shift_active = not self.sticky_shift_active
+            # Feedback visual (opcional, mas recomendado)
+            new_color = "#1E88E5" if self.sticky_shift_active else "#555"
+            if hasattr(self, "shift_btn_ref"): self.shift_btn_ref.configure(bg=new_color)
+
+        elif key_char == 'Caps':
+            self.caps_lock_active = not self.caps_lock_active
+            new_color = "#1E88E5" if self.caps_lock_active else "#555"
+            if hasattr(self, "caps_btn_ref"): self.caps_btn_ref.configure(bg=new_color)
+
+        # 3. Teclas de Caractere
+        else:
+            char_to_insert = key_char
+            is_letter = key_char.isalpha() and len(key_char) == 1
+
+            # Lógica XOR: (Caps ATIVADO e Shift DESATIVADO) ou (Caps DESATIVADO e Shift ATIVADO)
+            is_upper = self.caps_lock_active ^ self.sticky_shift_active
+
+            if is_letter:
+                char_to_insert = key_char.upper() if is_upper else key_char.lower()
+
+            widget.insert(tk.INSERT, char_to_insert)
+
+            # Desativa o Shift (sticky) após o uso
+            if self.sticky_shift_active:
+                self.sticky_shift_active = False
+                if hasattr(self, "shift_btn_ref"): self.shift_btn_ref.configure(bg="#555")
+
+        widget.focus_set()  # Mantém o foco no texto
+        widget.event_generate("<<Modified>>")  # Força a detecção de "dirty"
+
+    def _on_notepad_modified(self, event=None):
+        """Chamado quando o texto é alterado. Seta o flag 'dirty'."""
+        self.notepad_is_dirty = True
+        # Desativa o rastreador de "undo" do próprio widget
+        # para que possamos rastrear a sujeira de forma confiável
+        if self.notepad_text_widget:
+            self.notepad_text_widget.edit_modified(False)
+
+    def _handle_save_document(self):
+        """Salva o conteúdo atual em um .txt com timestamp."""
+        if not self.notepad_text_widget:
+            return
+
+        try:
+            os.makedirs(self.notepad_save_dir, exist_ok=True)
+            content = self.notepad_text_widget.get("1.0", tk.END)
+
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = os.path.join(self.notepad_save_dir, f"bloco_de_notas_{timestamp}.txt")
+
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(content)
+
+            self.notepad_is_dirty = False
+            self.notepad_last_save_content = content  # Atualiza o "ponto salvo"
+            self._show_custom_modal("Salvo", f"Documento salvo com sucesso em:\n{filename}")
+
+        except Exception as e:
+            messagebox.showerror("Erro ao Salvar", f"Não foi possível salvar o arquivo:\n{e}")
+
+    def _handle_new_document(self):
+        """Limpa o editor ou pede para salvar se houver alterações."""
+        if not self.notepad_text_widget:
+            return
+
+        current_content = self.notepad_text_widget.get("1.0", tk.END)
+        # Checa se está sujo (modificado) ou se está vazio (só com \n)
+        is_empty = not current_content.strip()
+
+        if is_empty or not self.notepad_is_dirty:
+            self._clear_notepad()
+        else:
+            # Precisa de diálogo. Por simplicidade, vamos usar o messagebox padrão
+            # (Um diálogo customizado controlável pelo olhar é bem mais complexo)
+            resposta = messagebox.askyesnocancel("Novo Documento", "Deseja salvar as alterações?")
+
+            if resposta is True:  # Sim
+                self._handle_save_document()
+                self._clear_notepad()
+            elif resposta is False:  # Não
+                self._clear_notepad()
+            elif resposta is None:  # Cancelar
+                pass  # Não faz nada
+
+    def _clear_notepad(self):
+        """Limpa o widget de texto e reseta os flags."""
+        self.notepad_last_save_content = ""
+        self.notepad_is_dirty = False
+        if self.notepad_text_widget:
+            self.notepad_text_widget.delete("1.0", tk.END)
+            self.notepad_text_widget.edit_modified(False)  # Reseta o flag interno
+
+    def _show_custom_modal(self, title, message):
+        """Cria um Toplevel modal (pop-up) controlável pelo olhar."""
+
+        # 1. Backup dos widgets focáveis da tela de fundo (teclado, botões, etc.)
+        self._modal_widget_backup = self.focusable_widgets
+        self.focusable_widgets = []
+        self.currently_snapped_widget = None  # Limpa o snap da tela anterior
+
+        # 2. Cria a janela do diálogo
+        dialog = tk.Toplevel(self)
+        dialog.title(title)
+        dialog.configure(bg="#222")
+        dialog.resizable(False, False)
+
+        # Centraliza no monitor ativo
+        mon = self.get_active_monitor()
+        w, h = 450, 220
+        x = mon.x + (mon.width // 2 - w // 2)
+        y = mon.y + (mon.height // 2 - h // 2)
+        dialog.geometry(f"{w}x{h}+{x}+{y}")
+
+        dialog.transient(self)  # Mantém no topo da aplicação
+        dialog.grab_set()  # Bloqueia interações de mouse com outras janelas
+
+        # 3. Adiciona conteúdo
+        msg_label = tk.Label(dialog, text=message, bg="#222", fg="white",
+                             font=("Arial", 14), wraplength=400, justify="center")
+        msg_label.pack(pady=30, padx=20, expand=True)
+
+        # 4. Botão "OK"
+        def _close_dialog():
+            self.focusable_widgets = self._modal_widget_backup  # Restaura widgets
+            self._modal_widget_backup = []
+            self.currently_snapped_widget = None
+            dialog.grab_release()
+            dialog.destroy()
+
+        ok_button = tk.Button(dialog, text="OK", font=("Arial", 16, "bold"),
+                              command=_close_dialog, width=10)
+        ok_button.pack(pady=20)
+
+        # 5. Adiciona o botão "OK" como o ÚNICO widget focável
+        self.focusable_widgets.append(ok_button)
+
+        # 6. Garante que, se o usuário fechar pelo "X", tudo é restaurado
+        dialog.protocol("WM_DELETE_WINDOW", _close_dialog)
+
     # --------- UI: Tela de calibração e perfis ----------
     def create_calibrator_view(self):
         self._clear_root()
@@ -456,114 +729,73 @@ class App(tk.Tk):
         self.create_dashboard()
 
     def create_dashboard(self):
-        # limpa tela e prepara estilos
+        # limpa tela
         self._clear_root()
         self.title("Dashboard - Controle Ocular")
-        cor_fundo = "#0b4073"  # azul-escuro do app
-        self.configure(bg=cor_fundo)
+        self.configure(bg="#0b4073")
 
-        # Header com perfil + monitor
-        active_profile = "Nenhum (Calibração Volátil)"
-        if self.tracker and getattr(self.tracker, "loaded_profile_name", None):
-            active_profile = self.tracker.loaded_profile_name
-        mon = self.get_active_monitor()
+        # 1. Cria a instância da View do Dashboard
+        # A 'parent' é 'self' (a janela principal do App)
+        # O 'controller' também é 'self' (a classe App com a lógica)
+        dashboard_view = DashboardFrame(self, controller=self)
+        dashboard_view.pack(fill="both", expand=True)
 
-        header = tk.Frame(self, bg=cor_fundo)
-        header.pack(fill="x", padx=20, pady=(10, 0))
+        # 2. Guarda a referência da tela atual e pega os widgets focáveis
+        self.current_screen = dashboard_view
+        self.focusable_widgets = dashboard_view.get_focusable_widgets()
 
-        # --- TÍTULO ADICIONADO ---
-        tk.Label(header,
-                 text="Simple Eye Tracker",
-                 font=("Poppins", 22, "bold"),
-                 bg=cor_fundo, fg="white").pack(side="left")
-        # --- FIM DA ADIÇÃO ---
-
-        # Label do perfil modificado para alinhar à direita
-        tk.Label(header,
-                 text=f"Perfil: {active_profile}   |   Monitor: {self.selected_monitor_index} ({mon.width}x{mon.height})",
-                 font=("Poppins", 14), bg=cor_fundo, fg="white").pack(side="right")  # <--- MUDANÇA AQUI
-
-        # Área central: grade 2x2 de tiles grandes
-        grid_frame = tk.Frame(self, bg=cor_fundo)
-        grid_frame.pack(expand=True, fill="both", padx=24, pady=24)
-
-        # Configura grade responsiva 2x2
-        for r in range(2):
-            grid_frame.rowconfigure(r, weight=1, uniform="row")
-        for c in range(2):
-            grid_frame.columnconfigure(c, weight=1, uniform="col")
-
-        # Caminhos dos ícones (como você pediu)
-        ICON_NOTEPAD = "resources/images/notepad.png"
-        ICON_SETTINGS = "resources/images/settings.png"
-
-        # Tile (0,0) — Notepad (funcional)
-        t00, surf00 = _criar_tile(
-            grid_frame,
-            image_path=ICON_NOTEPAD,
-            command=lambda: abrir_bloco_de_notas(self)
-        )
-        t00.grid(row=0, column=0, sticky="nsew", padx=16, pady=16)
-
-        # Tile (0,1) — Configurações (funcional)
-        t01, surf01 = _criar_tile(
-            grid_frame,
-            image_path=ICON_SETTINGS,
-            command=lambda: abrir_configuracoes(self)
-        )
-        t01.grid(row=0, column=1, sticky="nsew", padx=16, pady=16)
-
-        # Tile (1,0) — Slot vazio (inert)
-        t10, surf10 = _criar_tile(
-            grid_frame,
-            image_path=None,  # sem ícone por enquanto
-            command=None  # slot não funcional
-        )
-        t10.grid(row=1, column=0, sticky="nsew", padx=16, pady=16)
-
-        # Tile (1,1) — Slot vazio (inert)
-        t11, surf11 = _criar_tile(
-            grid_frame,
-            image_path=None,
-            command=None
-        )
-        t11.grid(row=1, column=1, sticky="nsew", padx=16, pady=16)
-
-        # Widgets "focáveis" para o snap (incluímos todos os quatro blocos)
-        # — os dois de baixo não têm ação, mas ajudam o cursor a "colar" em áreas grandes.
-        self.focusable_widgets = [surf00, surf01, surf10, surf11]
-
-        # Barra inferior: status + dica F7
-        bottom = tk.Frame(self, bg=cor_fundo)
-        bottom.pack(fill="x", pady=(0, 16))
-
-        # --- BLOCO DO BOTÃO DE PRÉVIA REMOVIDO ---
-
-        # Status Eye Tracking
-        self.status_label = tk.Label(
-            bottom,
-            text="Eye Tracking: DESATIVADO (Pressione F7)",
-            font=("Poppins", 16, "bold"), bg=cor_fundo, fg="white"
-        )
-        # --- MUDANÇA: Centraliza o status se for o único item ---
-        # (Se quiser ele na direita, mantenha .pack(side="right", padx=20))
-        self.status_label.pack(side="right", padx=20)
-
-        # Bindings e ciclo
+        # 3. Bindings e ciclo (permanecem na lógica principal)
         self.bind("<F7>", self.toggle_mouse_control)
         self.protocol("WM_DELETE_WINDOW", self.quit_app)
 
-        # Garante que a janela ocupa o monitor selecionado
+        # 4. Garante que a janela ocupa o monitor selecionado
         self.move_root_to_monitor(self.selected_monitor_index)
 
-        # Inicia o loop do controle ocular
+        # 5. Atualiza o status (caso já esteja ativo) e inicia o loop
+        self._update_status_label()  # Atualiza o label
         self.update_loop()
 
-    # --------- Controle do mouse/gaze ----------
+    def _load_sidebar_icons(self):
+        """Carrega e redimensiona ícones para a barra lateral."""
+        ICON_SIZE = (48, 48)
+        # --- Substitua pelos caminhos reais dos seus ícones ---
+        ICON_HOME_PATH = "resources/images/home.png"
+        ICON_NOTEPAD_PATH = "resources/images/notepad.png"  # Usando o mesmo do tile
+
+        try:
+            img = Image.open(ICON_HOME_PATH).resize(ICON_SIZE, Image.LANCZOS)
+            self.icon_home = ImageTk.PhotoImage(img)
+        except Exception as e:
+            print(f"Erro ao carregar ícone 'home': {e}")
+
+        try:
+            # Reusa o ícone do notepad, mas redimensiona
+            img = Image.open(ICON_NOTEPAD_PATH).resize(ICON_SIZE, Image.LANCZOS)
+            self.icon_notepad = ImageTk.PhotoImage(img)
+        except Exception as e:
+            print(f"Erro ao carregar ícone 'notepad' para sidebar: {e}")
+
+    def _update_status_label(self):
+        """Helper para atualizar o label de status na tela ativa."""
+        state_text = "ATIVADO" if self.mouse_control_enabled else "DESATIVADO"
+        full_text = f"Eye Tracking: {state_text} (Pressione F7)"
+
+        try:
+            # Caso 1: Estamos em uma "View" (como o Dashboard)
+            if hasattr(self.current_screen, "update_status_label"):
+                self.current_screen.update_status_label(full_text)
+
+            # Caso 2: Estamos na tela do Notepad (que ainda não é uma View)
+            elif hasattr(self, "notepad_status_label") and self.notepad_status_label:
+                self.notepad_status_label.config(text=full_text)
+        except tk.TclError:
+            # Janela foi destruída no meio da atualização, ignora o erro
+            pass
+
     def toggle_mouse_control(self, event=None):
         self.mouse_control_enabled = not self.mouse_control_enabled
-        state_text = "ATIVADO" if self.mouse_control_enabled else "DESATIVADO"
-        self.status_label.config(text=f"Eye Tracking: {state_text} (Pressione F7)")
+        self._update_status_label()  # <-- CHAMA O HELPER
+
         if not self.mouse_control_enabled:
             self.currently_snapped_widget = None
 
@@ -575,17 +807,17 @@ class App(tk.Tk):
             now = time.time()
             if self.just_clicked_time and (now - self.just_clicked_time < GAZE_MOVE_DELAY):
                 # Pausa o movimento do cursor pelo tempo de GAZE_MOVE_DELAY
-                self.after(50, self.update_loop)
+                self._update_loop_job = self.after(50, self.update_loop)
                 return
             # Reseta o flag se o tempo já passou
             self.just_clicked_time = 0
 
             lock = self.shared_state.get("_lock")
             if lock is None:
-                self.after(50, self.update_loop)
+                self._update_loop_job = self.after(50, self.update_loop)
                 return
 
-            # --- LÓGICA CORRIGIDA ---
+            # --- LÓGICA DE CLIQUE ATUALIZADA ---
             # 3. Pega o pedido de clique PRIMEIRO
             click_request = False
             with lock:
@@ -610,17 +842,26 @@ class App(tk.Tk):
                 with lock:
                     self.shared_state["click_request"] = False
 
-                # executa a ação do botão
+                # --- LÓGICA DE EXECUÇÃO MELHORADA ---
                 try:
-                    widget.invoke()  # funciona para Button
-                    pyautogui.click()
-                    self.just_clicked_time = time.time()  # Ativa o congelamento PÓS-clique
-                except:
-                    # se for Label (slot vazio), ignora
+                    # Caso 1: É um botão, invoca a ação
+                    widget.invoke()
+                except tk.TclError:
+                    # Caso 2: Não é um botão (ex: Label, Text, Frame)
+                    # Apenas foca nele.
+                    widget.focus_set()
+                except Exception as e:
+                    # Outro erro inesperado, ignora
+                    print(f"[EyeTracker] Erro no clique ocular (invoke): {e}")
                     pass
 
+                # Executa o clique do mouse e congela a tela, SEMPRE
+                pyautogui.click()
+                self.just_clicked_time = time.time()
+                # --- FIM DA LÓGICA MELHORADA ---
+
                 # Pula o resto da lógica de movimento para este frame
-                self.after(50, self.update_loop)
+                self._update_loop_job = self.after(50, self.update_loop)
                 return
 
             # 5. Se NÃO HOUVE CLIQUE, processa o movimento do olhar normalmente
@@ -646,6 +887,12 @@ class App(tk.Tk):
 
                 # Snap para botões "grandes"
                 closest_widget, min_dist_sq = None, float("inf")
+
+                # Proteção: só itera se a lista não for vazia
+                if not self.focusable_widgets:
+                    self._update_loop_job = self.after(50, self.update_loop)
+                    return
+
                 for widget in self.focusable_widgets:
                     if not widget.winfo_exists():
                         continue
@@ -668,18 +915,27 @@ class App(tk.Tk):
                         )
 
                         # --- destaca o widget atual ---
-                        if self.currently_snapped_widget:
+                        if self.currently_snapped_widget and self.currently_snapped_widget.winfo_exists():
                             try:
-                                self.currently_snapped_widget.configure(highlightbackground="#0b4073",
-                                                                        highlightthickness=3)
+                                # Lógica para Text vs Botão
+                                if isinstance(self.currently_snapped_widget, tk.Text):
+                                    self.currently_snapped_widget.configure(highlightbackground="white",
+                                                                            highlightthickness=2)
+                                else:
+                                    self.currently_snapped_widget.configure(highlightbackground="#0b4073",
+                                                                            highlightthickness=3)
                             except:
                                 pass
 
-                        try:
-                            closest_widget.configure(highlightbackground="#00ff00",
-                                                     highlightthickness=6)  # verde forte
-                        except:
-                            pass
+                        if closest_widget.winfo_exists():
+                            try:
+                                # Lógica para Text vs Botão
+                                if isinstance(closest_widget, tk.Text):
+                                    closest_widget.configure(highlightbackground="#00ff00", highlightthickness=4)
+                                else:
+                                    closest_widget.configure(highlightbackground="#00ff00", highlightthickness=6)
+                            except:
+                                pass
 
                         self.currently_snapped_widget = closest_widget
                 else:
@@ -705,16 +961,20 @@ class App(tk.Tk):
                             self.last_cursor_pos = gaze_point
 
                     # remove destaque se sair do foco
-                    if self.currently_snapped_widget:
+                    if self.currently_snapped_widget and self.currently_snapped_widget.winfo_exists():
                         try:
-                            self.currently_snapped_widget.configure(highlightbackground="#0b4073",
-                                                                    highlightthickness=3)
+                            if isinstance(self.currently_snapped_widget, tk.Text):
+                                self.currently_snapped_widget.configure(highlightbackground="white",
+                                                                        highlightthickness=2)
+                            else:
+                                self.currently_snapped_widget.configure(highlightbackground="#0b4073",
+                                                                        highlightthickness=3)
                         except:
                             pass
                         self.currently_snapped_widget = None
 
         # Reagenda o loop
-        self.after(50, self.update_loop)
+        self._update_loop_job = self.after(50, self.update_loop)
 
         # --------- Diálogo custom p/ nome do perfil ----------
 
@@ -748,9 +1008,18 @@ class App(tk.Tk):
 
     # --------- Infra ----------
     def _clear_root(self):
-        # interrompe quaisquer previews ao trocar de tela
+
+        if self._update_loop_job:
+            self.after_cancel(self._update_loop_job)
+            self._update_loop_job = None
+
         self._stop_camera_preview()
         self._stop_calib_preview()
+        self.notepad_text_widget = None
+        self.sticky_shift_active = False
+        self.caps_lock_active = False
+        self.notepad_status_label = None
+        self.focusable_widgets = [] # Limpa widgets focáveis
         for w in self.winfo_children():
             w.destroy()
 
