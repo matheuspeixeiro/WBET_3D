@@ -5,38 +5,36 @@ from PIL import Image, ImageTk
 
 PREVIEW_SIZE = (320, 240)
 
-
 class CalibratorFrame(tk.Frame):
     """
     A "Visão" (View) da tela de Calibração e Perfis.
     O 'controller' é a instância principal da classe App.
     """
-
     def __init__(self, parent, controller):
         self.controller = controller
         super().__init__(parent, bg="#222")
-
+        
         # Estado do preview desta tela
         self._calib_cap = None
         self._calib_job = None
-
+        
         # --- Construção da UI ---
-
+        
         tk.Label(self, text="Selecione um Perfil ou Crie um Novo",
                  font=("Arial", 26, "bold"), bg="#222", fg="white").pack(pady=30)
-
+        
         # --- Carregar Perfil ---
-        profiles = self.controller.get_profile_list()  # Pede a lista ao controller
+        profiles = self.controller.get_profile_list() # Pede a lista ao controller
         if profiles:
             tk.Label(self, text="Carregar Perfil Existente:",
                      font=("Arial", 16), bg="#222", fg="white").pack(pady=(20, 5))
-
+            
             # O controller (main.py) armazena a variável
             self.controller.profile_var = tk.StringVar(self)
             self.controller.profile_var.set(profiles[0])
-
+            
             tk.OptionMenu(self, self.controller.profile_var, *profiles).pack(pady=10)
-
+            
             tk.Button(self, text="Carregar Perfil", font=("Arial", 18),
                       command=self.controller.load_profile_and_start).pack(pady=20)
 
@@ -46,22 +44,22 @@ class CalibratorFrame(tk.Frame):
         # --- Monitor ---
         tk.Label(self, text="Monitor para Calibração:",
                  font=("Arial", 14), bg="#222", fg="white").pack(pady=(10, 5))
-
-        monitor_options = [f"Monitor {i} ({m.width}x{m.height})"
+        
+        monitor_options = [f"Monitor {i} ({m.width}x{m.height})" 
                            for i, m in enumerate(self.controller.available_monitors)]
-
+        
         self.controller.monitor_var = tk.StringVar(self)
         self.controller.monitor_var.set(monitor_options[self.controller.selected_monitor_index])
         tk.OptionMenu(self, self.controller.monitor_var, *monitor_options).pack(pady=10)
 
         # --- Câmera ---
-        tk.Label(self, text="Câmera para Calibração:",
+        tk.Label(self, text="Câmera para Calibração:", 
                  font=("Arial", 14), bg="#222", fg="white").pack(pady=(10, 5))
-
+        
         cam_labels = [c["label"] for c in self.controller._camera_list]
         self.controller.camera_var = tk.StringVar(self)
-
-        default_label = next((c["label"] for c in self.controller._camera_list
+        
+        default_label = next((c["label"] for c in self.controller._camera_list 
                               if c["index"] == self.controller.default_camera_index),
                              (cam_labels[0] if cam_labels else "Câmera 0"))
         self.controller.camera_var.set(default_label)
@@ -73,7 +71,7 @@ class CalibratorFrame(tk.Frame):
             if cam:
                 self._start_calib_preview(cam["index"])
 
-        tk.OptionMenu(self, self.controller.camera_var, *cam_labels,
+        tk.OptionMenu(self, self.controller.camera_var, *cam_labels, 
                       command=_on_calib_cam_change).pack(pady=10)
 
         # --- Botão Criar ---
@@ -83,7 +81,7 @@ class CalibratorFrame(tk.Frame):
         # --- Preview ---
         self.calib_preview = tk.Label(self, bg="#000")
         self.calib_preview.pack(pady=(6, 0))
-
+        
         sel_label = self.controller.camera_var.get()
         cam = next((c for c in self.controller._camera_list if c["label"] == sel_label), None)
         if cam:

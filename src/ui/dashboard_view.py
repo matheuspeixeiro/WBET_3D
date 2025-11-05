@@ -2,7 +2,6 @@
 import tkinter as tk
 from PIL import Image, ImageTk
 
-
 # --- FUNÇÃO AUXILIAR MOVIDA ---
 def _criar_tile(parent, image_path=None, command=None, border="#0b4073"):
     """
@@ -45,15 +44,14 @@ class DashboardFrame(tk.Frame):
     Contém todos os widgets da tela principal.
     O 'controller' é a instância principal da classe App.
     """
-
     def __init__(self, parent, controller):
         self.controller = controller
         self.cor_fundo = "#0b4073"  # azul-escuro do app
-
+        
         super().__init__(parent, bg=self.cor_fundo)
 
         # --- TODO O CÓDIGO DE CONSTRUÇÃO DA UI VEM PARA CÁ ---
-
+        
         # Header com perfil + monitor
         active_profile = "Nenhum (Calibração Volátil)"
         if self.controller.tracker and getattr(self.controller.tracker, "loaded_profile_name", None):
@@ -89,7 +87,7 @@ class DashboardFrame(tk.Frame):
             grid_frame,
             image_path=ICON_NOTEPAD,
             # Chama o método do *controller* (main.py)
-            command=self.controller.create_notepad_view
+            command=self.controller.create_notepad_view 
         )
         t00.grid(row=0, column=0, sticky="nsew", padx=16, pady=16)
 
@@ -134,11 +132,16 @@ class DashboardFrame(tk.Frame):
         self.status_label.pack(side="right", padx=20)
 
     # --- Métodos para o controller acessar ---
-
+    
     def get_focusable_widgets(self):
         """Retorna a lista de widgets que o tracker pode focar."""
-        return self._focusable_widgets
+        # --- CORREÇÃO AQUI ---
+        return self._focusable_widgets # Removido o "self." duplicado
 
     def update_status_label(self, text):
         """Atualiza o texto do label de status (ativado/desativado)."""
         self.status_label.config(text=text)
+
+    def on_destroy(self):
+        """Método de limpeza chamado pelo controller."""
+        pass

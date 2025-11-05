@@ -23,11 +23,12 @@ from tracking import calibration
 
 # --- CONSTANTES ---
 SNAP_THRESHOLD_PIXELS = 300
-CAM_PROBE_MAX = 1
+CAM_PROBE_MAX = 4
 PREVIEW_SIZE = (320, 240)  # Usado pela tela de startup
 GAZE_MOVE_DELAY = 5
 GAZE_STABILITY_DELAY = 1.5
 GAZE_TOLERANCE_PX = 80
+SCAN_DELAY_SECONDS = 3.0  # Tempo de varredura (3 segundos)
 
 
 # --- CLASSE PRINCIPAL (CONTROLLER) ---
@@ -61,6 +62,18 @@ class App(tk.Tk):
         self._update_loop_job = None
         self._modal_widget_backup = []
         self.is_navigating = False
+
+        # --- Estado do Modo de Varredura (Scanner) ---
+        self.scan_mode_active = False
+        self.keyboard_frame_widget = None # Referência ao frame do teclado
+        self.scan_key_list = []           # Lista de teclas em ordem
+        self.scan_index = -1              # Índice da tecla selecionada
+        self.last_scan_time = 0           # Timer para o scanner
+        # --- CONSTANTES DE COR DO SCANNER ---
+        self.KEY_STYLE_BG = "#EEEEEE"
+        self.SPECIAL_KEY_STYLE_BG = "#CCCCCC"
+        self.HIGHLIGHT_BG = "#00ff00" # Verde-limão
+        self.HIGHLIGHT_THICKNESS = 6  # Espessura do destaque
 
         # --- Vars do Tkinter (para as views lerem/escreverem) ---
         self.profile_var = None
@@ -290,7 +303,12 @@ class App(tk.Tk):
         self.current_screen = notepad_view
         self.focusable_widgets = notepad_view.get_focusable_widgets()
 
+        # Pega as referências da View para o modo de varredura
+        self.keyboard_frame_widget = notepad_view.keyboard_frame
+        self.scan_key_list = notepad_view.get_scan_keys()
+
         self.bind("<F7>", self.toggle_mouse_control)
+        self.bind("<Escape>", self._handle_scan_exit) # LIGA O ESCAPE
         self.protocol("WM_DELETE_WINDOW", self.quit_app)
         self.move_root_to_monitor()
 
@@ -532,6 +550,133 @@ class App(tk.Tk):
 
     # --------- Lógica de Gaze e Loop (Controller) ----------
 
+    def _get_current_gaze_coords(self):
+        """Helper para obter as coordenadas (x, y) atuais do olhar."""
+        if not self.tracker:
+            return None
+            
+        gaze_data = self.tracker.get_screen_gaze()
+        if not gaze_data:
+            return None
+
+        gaze_x, gaze_y, _, _, _ = gaze_data
+        mon = self.get_active_monitor()
+        final_gaze_x = gaze_x + mon.x
+        final_gaze_y = gaze_y + mon.y
+        return (final_gaze_x, final_gaze_y)
+
+    def _get_gaze_to_widget_dist(self, widget):
+        """Helper que retorna a distância do olhar atual ao centro de um widget."""
+        if not widget or not widget.winfo_exists():
+            return None
+        
+        gaze_coords = self.get_current_gaze_coords()
+        if not gaze_coords:
+            return None
+            
+        gx, gy = gaze_coords
+        
+        x = widget.winfo_rootx()
+        y = widget.winfo_rooty()
+        w = widget.winfo_width()
+        h = widget.winfo_height()
+        center_x, center_y = x + w / 2, y + h / 2
+        
+        dist_sq = (final_gaze_x - center_x) ** 2 + (final_gaze_y - center_y) ** 2
+        return dist_sq ** 0.5
+
+    def _is_gaze_in_widget_bounds(self, widget):
+        """Verifica se as coordenadas atuais do olhar estão DENTRO dos limites de um widget."""
+        if not widget or not widget.winfo_exists():
+            return False
+            
+        gaze_coords = self._get_current_gaze_coords()
+        if not gaze_coords:
+            return False # Não há dados do olhar
+            
+        gx, gy = gaze_coords
+        
+        x1 = widget.winfo_rootx()
+        y1 = widget.winfo_rooty()
+        x2 = x1 + widget.winfo_width()
+        y2 = y1 + widget.winfo_height()
+        
+        return (x1 <= gx <= x2) and (y1 <= gy <= y2)
+    
+    def _handle_scan_exit(self, event=None):
+        """Lida com a tecla 'Escape' para sair do modo de varredura."""
+        if not self.scan_mode_active:
+            return
+
+        print("[Scanner] Saída forçada via 'Escape'. Desativando.")
+        self.scan_mode_active = False
+
+        # Limpa o destaque da última tecla
+        if 0 <= self.scan_index < len(self.scan_key_list):
+            try:
+                key = self.scan_key_list[self.scan_index]
+                is_special = len(key.cget('text')) > 1 or not key.cget('text').isalnum()
+                # --- CORREÇÃO: Usa as constantes de cor da classe ---
+                bg_to_set = self.SPECIAL_KEY_STYLE_BG if is_special else self.KEY_STYLE_BG
+                key.configure(
+                    highlightbackground=bg_to_set, 
+                    highlightthickness=4
+                )
+            except: pass 
+                
+        self.scan_index = -1
+
+    def _handle_scan_mode(self):
+        """Lógica principal do modo de varredura (Fase 2)."""
+        
+        # --- Lógica do Scanner (Fase 2) ---
+        now = time.time()
+        if (now - self.last_scan_time) >= SCAN_DELAY_SECONDS:
+            
+            # 3a. Remove o destaque da tecla anterior
+            if 0 <= self.scan_index < len(self.scan_key_list):
+                try:
+                    key = self.scan_key_list[self.scan_index]
+                    is_special = len(key.cget('text')) > 1 or not key.cget('text').isalnum()
+                    bg_to_set = self.SPECIAL_KEY_STYLE_BG if is_special else self.KEY_STYLE_BG
+                    
+                    # Restaura a cor correta (incluindo 'Caps' e 'Shift' ativos)
+                    if key == self.shift_btn_ref and self.sticky_shift_active:
+                         bg_to_set = "#1E88E5"
+                    elif key == self.caps_btn_ref and self.caps_lock_active:
+                         bg_to_set = "#1E88E5"
+                    
+                    key.configure(
+                        highlightbackground=bg_to_set, 
+                        highlightthickness=4
+                    )
+                except: pass 
+            
+            # 3b. Avança o índice
+            self.scan_index += 1
+            
+            # 3c. Loopa de volta ao início
+            if self.scan_index >= len(self.scan_key_list):
+                self.scan_index = 0
+                
+            # 3d. Adiciona destaque à nova tecla
+            if 0 <= self.scan_index < len(self.scan_key_list):
+                try:
+                    new_key = self.scan_key_list[self.scan_index]
+                    new_key.configure(
+                        highlightbackground=self.HIGHLIGHT_BG, 
+                        highlightthickness=self.HIGHLIGHT_THICKNESS
+                    )
+                except: pass
+            
+            # 3e. Reseta o timer
+            self.last_scan_time = time.time()
+        
+        # --- 4. Placeholders (Fases 3 e 4) ---
+        # (Aqui entrará a lógica de checar piscada)
+        # (Aqui entrará a lógica de checar olho direito para boost)
+
+
     def _update_status_label(self):
         """Helper para atualizar o label de status na view ativa."""
         state_text = "ATIVADO" if self.mouse_control_enabled else "DESATIVADO"
@@ -551,6 +696,13 @@ class App(tk.Tk):
     def update_loop(self):
         if self.mouse_control_enabled and self.tracker:
 
+            # Verifica o Modo de Varredura PRIMEIRO
+            if self.scan_mode_active:
+                self._handle_scan_mode()
+                # Reagenda o loop e para a execução do snap
+                self._update_loop_job = self.after(50, self.update_loop)
+                return
+            
             # 1. Checa "congelamento" pós-clique
             now = time.time()
             if self.just_clicked_time and (now - self.just_clicked_time < GAZE_MOVE_DELAY):
@@ -562,8 +714,8 @@ class App(tk.Tk):
             if lock is None:
                 self._update_loop_job = self.after(50, self.update_loop)
                 return
-
-            self.is_navigating = False  # Reseta o flag
+                
+            self.is_navigating = False # Reseta o flag
 
             # 2. Pega clique
             click_request = False
@@ -571,15 +723,14 @@ class App(tk.Tk):
                 click_request = self.shared_state.get("click_request", False)
 
             # 3. Processa clique
-            if click_request and self.currently_snapped_widget:
+            if click_request and self.currently_snapped_widget and not self.scan_mode_active:
                 widget = self.currently_snapped_widget
-
+                
+                # Lógica de PRINT segura
                 widget_info = ""
                 if isinstance(widget, (tk.Button, tk.Label)):
-                    try:
-                        widget_info = widget.cget('text')
-                    except Exception:
-                        widget_info = str(widget)
+                    try: widget_info = widget.cget('text')
+                    except Exception: widget_info = str(widget)
                 elif isinstance(widget, tk.Text):
                     widget_info = "Área de Texto"
                 else:
@@ -592,8 +743,7 @@ class App(tk.Tk):
                     widget.configure(highlightbackground="#00ff88", highlightthickness=8)
                     widget.after(150,
                                  lambda: widget.configure(highlightbackground=original_color, highlightthickness=6))
-                except:
-                    pass
+                except: pass
 
                 with lock:
                     self.shared_state["click_request"] = False
@@ -602,18 +752,19 @@ class App(tk.Tk):
                 try:
                     widget.invoke()
                 except tk.TclError:
+                    # Se não for botão (ex: tk.Text), apenas foca
                     widget.focus_set()
                 except Exception as e:
                     print(f"[EyeTracker] Erro no clique ocular (invoke): {e}")
-
+                
                 # VERIFICA SE A AÇÃO FOI DE NAVEGAÇÃO
                 if self.is_navigating:
-                    return  # Para este loop; a nova tela iniciará o seu
-
+                    return # Para este loop; a nova tela iniciará o seu
+                
                 # Se não for navegação, clica e congela
                 pyautogui.click()
                 self.just_clicked_time = time.time()
-
+                
                 self._update_loop_job = self.after(50, self.update_loop)
                 return
 
@@ -626,7 +777,7 @@ class App(tk.Tk):
             with lock:
                 is_frozen = self.shared_state.get("gaze_frozen", False)
                 frozen = self.shared_state.get("frozen_gaze_coords") if is_frozen else None
-
+            
             gaze_data = frozen if is_frozen else self.tracker.get_screen_gaze()
 
             if gaze_data:
@@ -637,7 +788,7 @@ class App(tk.Tk):
 
                 # Lógica de Snap
                 closest_widget, min_dist_sq = None, float("inf")
-
+                
                 if not self.focusable_widgets:
                     self._update_loop_job = self.after(50, self.update_loop)
                     return
@@ -655,6 +806,27 @@ class App(tk.Tk):
                 # Aplica Snap/Highlight
                 if closest_widget and min_dist_sq ** 0.5 <= SNAP_THRESHOLD_PIXELS:
                     if closest_widget != self.currently_snapped_widget:
+                        
+                        # Ativa o Modo de Varredura
+                        if closest_widget == self.keyboard_frame_widget:
+                            print("[Scanner] Gaze entrou no teclado. Ativando.")
+                            self.scan_mode_active = True
+                            self.currently_snapped_widget = None
+                            
+                            # Inicializa o scanner
+                            self.scan_index = -1 
+                            self.last_scan_time = time.time() - SCAN_DELAY_SECONDS # Força scan imediato
+                            
+                            try: 
+                                if isinstance(closest_widget, tk.Frame):
+                                    pass # Ignora destaque em Frame
+                                else:
+                                    closest_widget.configure(highlightbackground="#0b4073", highlightthickness=3)
+                            except: pass
+                            
+                            self._update_loop_job = self.after(50, self.update_loop)
+                            return # Pula o resto do snap
+                        
                         pyautogui.moveTo(
                             closest_widget.winfo_rootx() + closest_widget.winfo_width() / 2,
                             closest_widget.winfo_rooty() + closest_widget.winfo_height() / 2,
@@ -664,13 +836,10 @@ class App(tk.Tk):
                         if self.currently_snapped_widget and self.currently_snapped_widget.winfo_exists():
                             try:
                                 if isinstance(self.currently_snapped_widget, tk.Text):
-                                    self.currently_snapped_widget.configure(highlightbackground="white",
-                                                                            highlightthickness=2)
+                                    self.currently_snapped_widget.configure(highlightbackground="white", highlightthickness=2)
                                 else:
-                                    self.currently_snapped_widget.configure(highlightbackground="#0b4073",
-                                                                            highlightthickness=3)
-                            except:
-                                pass
+                                    self.currently_snapped_widget.configure(highlightbackground="#0b4073", highlightthickness=3)
+                            except: pass
                         # Adiciona highlight novo
                         if closest_widget.winfo_exists():
                             try:
@@ -678,10 +847,9 @@ class App(tk.Tk):
                                     closest_widget.configure(highlightbackground="#00ff00", highlightthickness=4)
                                 else:
                                     closest_widget.configure(highlightbackground="#00ff00", highlightthickness=6)
-                            except:
-                                pass
+                            except: pass
                         self.currently_snapped_widget = closest_widget
-
+                
                 # Lógica de Free-Move (sem snap)
                 else:
                     if not is_frozen:
@@ -692,7 +860,7 @@ class App(tk.Tk):
                             self.last_stable_time = now
 
                         dist = ((gaze_point[0] - self.last_gaze_pos[0]) ** 2 + (
-                                gaze_point[1] - self.last_gaze_pos[1]) ** 2) ** 0.5
+                                    gaze_point[1] - self.last_gaze_pos[1]) ** 2) ** 0.5
 
                         if dist > GAZE_TOLERANCE_PX:
                             self.last_gaze_pos = gaze_point
@@ -700,18 +868,15 @@ class App(tk.Tk):
                         elif now - self.last_stable_time >= GAZE_STABILITY_DELAY:
                             pyautogui.moveTo(gaze_point[0], gaze_point[1], duration=0.1)
                             self.last_cursor_pos = gaze_point
-
+                    
                     # Remove highlight ao sair do foco
                     if self.currently_snapped_widget and self.currently_snapped_widget.winfo_exists():
                         try:
                             if isinstance(self.currently_snapped_widget, tk.Text):
-                                self.currently_snapped_widget.configure(highlightbackground="white",
-                                                                        highlightthickness=2)
+                                self.currently_snapped_widget.configure(highlightbackground="white", highlightthickness=2)
                             else:
-                                self.currently_snapped_widget.configure(highlightbackground="#0b4073",
-                                                                        highlightthickness=3)
-                        except:
-                            pass
+                                self.currently_snapped_widget.configure(highlightbackground="#0b4073", highlightthickness=3)
+                        except: pass
                         self.currently_snapped_widget = None
 
         # Reagenda o loop
@@ -720,11 +885,17 @@ class App(tk.Tk):
     # --------- Infra (Limpeza e Saída) ----------
 
     def _clear_root(self):
-        self.is_navigating = True
+        self.is_navigating = True 
 
         if self._update_loop_job:
             self.after_cancel(self._update_loop_job)
             self._update_loop_job = None
+        
+        # Desliga o binding do Escape
+        try:
+            self.unbind("<Escape>")
+        except tk.TclError:
+            pass 
 
         # Limpa a view antiga (ex: parar preview da calibração)
         if self.current_screen and hasattr(self.current_screen, "on_destroy"):
@@ -738,6 +909,13 @@ class App(tk.Tk):
         self.caps_lock_active = False
         self.focusable_widgets = []
         self.current_screen = None
+        
+        # Reseta o estado de varredura
+        self.scan_mode_active = False
+        self.keyboard_frame_widget = None
+        self.scan_key_list = []
+        self.scan_index = -1
+        self.last_scan_time = 0
 
         for w in self.winfo_children():
             w.destroy()
