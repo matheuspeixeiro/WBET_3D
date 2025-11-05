@@ -69,6 +69,17 @@ class App(tk.Tk):
         self.scan_key_list = []           # Lista de teclas em ordem
         self.scan_index = -1              # Índice da tecla selecionada
         self.last_scan_time = 0           # Timer para o scanner
+        self.is_dwell_clicking = False    # Pausa o scanner
+        self.dwell_start_time = 0         # Timer da piscada de 2s
+        self.blink_pre_dwell_start_time = 0 # <-- NOVO: Timer da piscada de 1s
+
+        # --- Estado de Clique (Substitui click_request) ---
+        self.blink_state = "IDLE" # IDLE, PRE_LOCKED, LOCKED
+        self.blink_start_time = 0
+        self.BLINK_CLICK_DURATION_DASHBOARD = 1.0 # O 1seg antigo
+        self.BLINK_CLICK_DURATION_SCANNER = 0.3   
+        self.SCAN_DWELL_PRE_TIMER_SECONDS = 0.7   
+
         # --- CONSTANTES DE COR DO SCANNER ---
         self.KEY_STYLE_BG = "#EEEEEE"
         self.SPECIAL_KEY_STYLE_BG = "#CCCCCC"
@@ -570,7 +581,7 @@ class App(tk.Tk):
         if not widget or not widget.winfo_exists():
             return None
         
-        gaze_coords = self.get_current_gaze_coords()
+        gaze_coords = self._get_current_gaze_coords()
         if not gaze_coords:
             return None
             
@@ -616,7 +627,6 @@ class App(tk.Tk):
             try:
                 key = self.scan_key_list[self.scan_index]
                 is_special = len(key.cget('text')) > 1 or not key.cget('text').isalnum()
-                # --- CORREÇÃO: Usa as constantes de cor da classe ---
                 bg_to_set = self.SPECIAL_KEY_STYLE_BG if is_special else self.KEY_STYLE_BG
                 key.configure(
                     highlightbackground=bg_to_set, 
@@ -625,12 +635,67 @@ class App(tk.Tk):
             except: pass 
                 
         self.scan_index = -1
+        self.is_dwell_clicking = False
+        self.blink_pre_dwell_start_time = 0
 
     def _handle_scan_mode(self):
-        """Lógica principal do modo de varredura (Fase 2)."""
+        """Lógica principal do modo de varredura (Fases 2 e 3)."""
         
-        # --- Lógica do Scanner (Fase 2) ---
         now = time.time()
+        
+        # --- LÓGICA FASE 3: CHECA PISCADA ---
+        is_blinking = False
+        lock = self.shared_state.get("_lock")
+        if lock:
+            with lock:
+                is_blinking = self.shared_state.get("is_blinking", False)
+        else:
+            return 
+
+        if is_blinking:
+            # --- Inicia o pré-timer (1s) ---
+            if self.blink_pre_dwell_start_time == 0:
+                self.blink_pre_dwell_start_time = time.time()
+
+            # --- Checa se o Dwell (pausa) deve ser ativado ---
+            if not self.is_dwell_clicking and (time.time() - self.blink_pre_dwell_start_time) >= self.SCAN_DWELL_PRE_TIMER_SECONDS:
+                self.is_dwell_clicking = True
+                self.dwell_start_time = time.time()
+                print("[Scanner] Dwell (1s) detectado. Pausando scan.")
+            
+            # --- Se o Dwell ESTÁ ativo, checa o clique (2s) ---
+            if self.is_dwell_clicking:
+                if (time.time() - self.dwell_start_time) >= self.BLINK_CLICK_DURATION_SCANNER:
+                    print("[Scanner] CLIQUE (2s)!")
+                    if 0 <= self.scan_index < len(self.scan_key_list):
+                        try:
+                            key = self.scan_key_list[self.scan_index]
+                            key.invoke()
+                        except: pass
+                    
+                    self.is_dwell_clicking = False
+                    self.dwell_start_time = 0
+                    self.blink_pre_dwell_start_time = 0
+                    self.last_scan_time = time.time()
+                    self.just_clicked_time = time.time()
+            
+            # Se está piscando (em pré-timer ou dwell), não avança o scanner.
+            return 
+
+        else: # Não está piscando (olhos abertos)
+            if self.is_dwell_clicking:
+                print("[Scanner] Clique cancelado (abriu os olhos).")
+                self.is_dwell_clicking = False
+                self.dwell_start_time = 0
+                self.last_scan_time = time.time() # Resume o scanner
+            
+            # Reseta o pré-timer se a piscada foi involuntária
+            if self.blink_pre_dwell_start_time > 0:
+                self.blink_pre_dwell_start_time = 0
+        # --- FIM DA LÓGICA FASE 3 ---
+
+        # --- Lógica do Scanner (Fase 2) ---
+        # SÓ avança o scanner se NÃO estivermos no meio de um clique
         if (now - self.last_scan_time) >= SCAN_DELAY_SECONDS:
             
             # 3a. Remove o destaque da tecla anterior
@@ -640,7 +705,6 @@ class App(tk.Tk):
                     is_special = len(key.cget('text')) > 1 or not key.cget('text').isalnum()
                     bg_to_set = self.SPECIAL_KEY_STYLE_BG if is_special else self.KEY_STYLE_BG
                     
-                    # Restaura a cor correta (incluindo 'Caps' e 'Shift' ativos)
                     if key == self.shift_btn_ref and self.sticky_shift_active:
                          bg_to_set = "#1E88E5"
                     elif key == self.caps_btn_ref and self.caps_lock_active:
@@ -671,10 +735,6 @@ class App(tk.Tk):
             
             # 3e. Reseta o timer
             self.last_scan_time = time.time()
-        
-        # --- 4. Placeholders (Fases 3 e 4) ---
-        # (Aqui entrará a lógica de checar piscada)
-        # (Aqui entrará a lógica de checar olho direito para boost)
 
 
     def _update_status_label(self):
@@ -699,7 +759,6 @@ class App(tk.Tk):
             # Verifica o Modo de Varredura PRIMEIRO
             if self.scan_mode_active:
                 self._handle_scan_mode()
-                # Reagenda o loop e para a execução do snap
                 self._update_loop_job = self.after(50, self.update_loop)
                 return
             
@@ -717,16 +776,31 @@ class App(tk.Tk):
                 
             self.is_navigating = False # Reseta o flag
 
-            # 2. Pega clique
-            click_request = False
+            # 2. Pega clique (Lógica do Dashboard)
+            click_request = False # Flag de clique para este ciclo
+            is_blinking = False
             with lock:
-                click_request = self.shared_state.get("click_request", False)
+                is_blinking = self.shared_state.get("is_blinking", False)
 
-            # 3. Processa clique
-            if click_request and self.currently_snapped_widget and not self.scan_mode_active:
+            if self.blink_state == "IDLE":
+                if is_blinking:
+                    self.blink_state = "PRE_LOCKED"
+                    self.blink_start_time = time.time()
+            elif self.blink_state == "PRE_LOCKED":
+                if not is_blinking: # Abriu os olhos
+                    self.blink_state = "IDLE"
+                elif (time.time() - self.blink_start_time) > self.BLINK_CLICK_DURATION_DASHBOARD:
+                    click_request = True
+                    self.blink_state = "LOCKED" # Espera abrir os olhos
+            elif self.blink_state == "LOCKED":
+                if not is_blinking: # Abriu os olhos
+                    self.blink_state = "IDLE"
+            # --- FIM DA LÓGICA DE CLIQUE ---
+
+            # 3. Processa clique (Modo Snap)
+            if click_request and self.currently_snapped_widget:
                 widget = self.currently_snapped_widget
                 
-                # Lógica de PRINT segura
                 widget_info = ""
                 if isinstance(widget, (tk.Button, tk.Label)):
                     try: widget_info = widget.cget('text')
@@ -745,8 +819,7 @@ class App(tk.Tk):
                                  lambda: widget.configure(highlightbackground=original_color, highlightthickness=6))
                 except: pass
 
-                with lock:
-                    self.shared_state["click_request"] = False
+                # (Não precisamos mais do lock para 'click_request')
 
                 # Executa ação
                 try:
@@ -757,11 +830,9 @@ class App(tk.Tk):
                 except Exception as e:
                     print(f"[EyeTracker] Erro no clique ocular (invoke): {e}")
                 
-                # VERIFICA SE A AÇÃO FOI DE NAVEGAÇÃO
                 if self.is_navigating:
-                    return # Para este loop; a nova tela iniciará o seu
+                    return
                 
-                # Se não for navegação, clica e congela
                 pyautogui.click()
                 self.just_clicked_time = time.time()
                 
@@ -769,17 +840,13 @@ class App(tk.Tk):
                 return
 
             # 4. Limpa clique (se não usado)
-            if click_request:
-                with lock:
-                    self.shared_state["click_request"] = False
+            # (Não é mais necessário, click_request é local)
 
             # 5. Processa movimento do olhar
             with lock:
-                is_frozen = self.shared_state.get("gaze_frozen", False)
-                frozen = self.shared_state.get("frozen_gaze_coords") if is_frozen else None
+                # O 'gaze_frozen' não existe mais
+                gaze_data = self.shared_state.get("gaze")
             
-            gaze_data = frozen if is_frozen else self.tracker.get_screen_gaze()
-
             if gaze_data:
                 gaze_x, gaze_y, _, _, _ = gaze_data
                 mon = self.get_active_monitor()
@@ -813,19 +880,18 @@ class App(tk.Tk):
                             self.scan_mode_active = True
                             self.currently_snapped_widget = None
                             
-                            # Inicializa o scanner
                             self.scan_index = -1 
-                            self.last_scan_time = time.time() - SCAN_DELAY_SECONDS # Força scan imediato
+                            self.last_scan_time = time.time() - SCAN_DELAY_SECONDS
                             
                             try: 
                                 if isinstance(closest_widget, tk.Frame):
-                                    pass # Ignora destaque em Frame
+                                    pass 
                                 else:
                                     closest_widget.configure(highlightbackground="#0b4073", highlightthickness=3)
                             except: pass
                             
                             self._update_loop_job = self.after(50, self.update_loop)
-                            return # Pula o resto do snap
+                            return 
                         
                         pyautogui.moveTo(
                             closest_widget.winfo_rootx() + closest_widget.winfo_width() / 2,
@@ -852,22 +918,22 @@ class App(tk.Tk):
                 
                 # Lógica de Free-Move (sem snap)
                 else:
-                    if not is_frozen:
-                        now = time.time()
-                        gaze_point = (final_gaze_x, final_gaze_y)
-                        if self.last_gaze_pos is None:
-                            self.last_gaze_pos = gaze_point
-                            self.last_stable_time = now
+                    # O 'gaze_frozen' não existe mais, então o free-move está sempre ativo
+                    now = time.time()
+                    gaze_point = (final_gaze_x, final_gaze_y)
+                    if self.last_gaze_pos is None:
+                        self.last_gaze_pos = gaze_point
+                        self.last_stable_time = now
 
-                        dist = ((gaze_point[0] - self.last_gaze_pos[0]) ** 2 + (
-                                    gaze_point[1] - self.last_gaze_pos[1]) ** 2) ** 0.5
+                    dist = ((gaze_point[0] - self.last_gaze_pos[0]) ** 2 + (
+                                gaze_point[1] - self.last_gaze_pos[1]) ** 2) ** 0.5
 
-                        if dist > GAZE_TOLERANCE_PX:
-                            self.last_gaze_pos = gaze_point
-                            self.last_stable_time = now
-                        elif now - self.last_stable_time >= GAZE_STABILITY_DELAY:
-                            pyautogui.moveTo(gaze_point[0], gaze_point[1], duration=0.1)
-                            self.last_cursor_pos = gaze_point
+                    if dist > GAZE_TOLERANCE_PX:
+                        self.last_gaze_pos = gaze_point
+                        self.last_stable_time = now
+                    elif now - self.last_stable_time >= GAZE_STABILITY_DELAY:
+                        pyautogui.moveTo(gaze_point[0], gaze_point[1], duration=0.1)
+                        self.last_cursor_pos = gaze_point
                     
                     # Remove highlight ao sair do foco
                     if self.currently_snapped_widget and self.currently_snapped_widget.winfo_exists():
@@ -891,17 +957,15 @@ class App(tk.Tk):
             self.after_cancel(self._update_loop_job)
             self._update_loop_job = None
         
-        # Desliga o binding do Escape
         try:
             self.unbind("<Escape>")
         except tk.TclError:
             pass 
 
-        # Limpa a view antiga (ex: parar preview da calibração)
         if self.current_screen and hasattr(self.current_screen, "on_destroy"):
             self.current_screen.on_destroy()
 
-        self._stop_camera_preview()  # Para o preview da tela de startup
+        self._stop_camera_preview()
 
         # Reseta o estado do controller
         self.notepad_text_widget = None
@@ -916,13 +980,20 @@ class App(tk.Tk):
         self.scan_key_list = []
         self.scan_index = -1
         self.last_scan_time = 0
+        self.is_dwell_clicking = False
+        self.dwell_start_time = 0
+        self.blink_pre_dwell_start_time = 0 # <-- NOVO
+        
+        # Reseta o estado de clique do dashboard
+        self.blink_state = "IDLE"
+        self.blink_start_time = 0
 
         for w in self.winfo_children():
             w.destroy()
 
     def quit_app(self):
         try:
-            self._clear_root()  # Garante que todos os loops são parados
+            self._clear_root()
             if self.tracker:
                 self.tracker.stop()
         finally:

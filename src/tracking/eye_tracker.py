@@ -15,7 +15,7 @@ class EyeTracker(threading.Thread):
     RIGHT_EYE_OUTLINE_IDX = [133, 160, 158, 33, 153, 144]
 
     EAR_THRESHOLD = 0.2
-    BLINK_CLICK_DURATION = 1.0
+    # BLINK_CLICK_DURATION foi movido para o main.py
 
     def __init__(self, camera_index: int = 0, shared_state: dict = None):
         super().__init__(daemon=True, name="EyeTrackerThread")
@@ -34,9 +34,7 @@ class EyeTracker(threading.Thread):
         self.right_calibration_nose_scale = None
         self.R_ref_nose = [None]
         self.base_radius = 20
-        self.blink_state = "IDLE"
-        self.blink_state_start_time = 0
-        self.loaded_profile_name = None  # novo
+        self.loaded_profile_name = None
 
     def _compute_iris_center(self, landmarks, indexes):
         points = np.array([[landmarks[i].x * mc.w, landmarks[i].y * mc.h, landmarks[i].z * mc.w] for i in indexes])
@@ -56,6 +54,13 @@ class EyeTracker(threading.Thread):
         self.face_mesh = self.mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True)
         if not self.cap or not self.cap.isOpened():
             self.cap = cv2.VideoCapture(self.camera_index)
+        
+        # Garante que a captura foi bem-sucedida
+        if not self.cap.isOpened():
+            print(f"ERRO: Não foi possível abrir a câmera índice {self.camera_index}")
+            self.running = False
+            return
+            
         mc.w, mc.h = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         self.running = True
@@ -70,6 +75,9 @@ class EyeTracker(threading.Thread):
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = self.face_mesh.process(rgb)
             gaze_is_valid = False
+
+            # --- DADOS PADRÃO PARA O SHARED_STATE ---
+            current_is_blinking = False
 
             if results.multi_face_landmarks:
                 landmarks = results.multi_face_landmarks[0].landmark
@@ -101,34 +109,20 @@ class EyeTracker(threading.Thread):
                     last_valid_gaze = (screen_x, screen_y, raw_yaw, raw_pitch, 1.0)
                     gaze_is_valid = True
 
-                # Lógica de piscar -> congelar/clicar
+                # --- LÓGICA DE PISCADA SIMPLIFICADA (FASE 3) ---
                 left_ear = self._compute_ear(landmarks, self.LEFT_EYE_OUTLINE_IDX)
                 right_ear = self._compute_ear(landmarks, self.RIGHT_EYE_OUTLINE_IDX)
                 avg_ear = (left_ear + right_ear) / 2.0
-                is_blinking = avg_ear < self.EAR_THRESHOLD
+                current_is_blinking = avg_ear < self.EAR_THRESHOLD
+                # --- FIM DA LÓGICA DE PISCADA ---
 
-                if self.blink_state == "IDLE":
-                    if is_blinking:
-                        self.blink_state = "PRE_LOCKED"
-                        self.blink_state_start_time = time.time()
-                        with self.lock:
-                            self.shared_state["gaze_frozen"] = True
-                            if last_valid_gaze:
-                                self.shared_state["frozen_gaze_coords"] = last_valid_gaze
-                elif self.blink_state == "PRE_LOCKED":
-                    if not is_blinking:
-                        self.blink_state = "IDLE"
-                        with self.lock:
-                            self.shared_state["gaze_frozen"] = False
-                    elif (time.time() - self.blink_state_start_time) > self.BLINK_CLICK_DURATION:
-                        with self.lock:
-                            self.shared_state["click_request"] = True
-                            self.shared_state["gaze_frozen"] = False
-                        self.blink_state = "IDLE"
-
-            if gaze_is_valid:
-                with self.lock:
+            # --- ATUALIZA O ESTADO COMPARTILHADO ---
+            with self.lock:
+                if gaze_is_valid:
                     self.shared_state["gaze"] = last_valid_gaze
+                
+                # Envia o estado da piscada continuamente
+                self.shared_state["is_blinking"] = current_is_blinking
 
             time.sleep(0.001)
 
@@ -234,6 +228,10 @@ class EyeTracker(threading.Thread):
                     print("[Calibração] Centro da tela calibrado.")
 
         cv2.destroyAllWindows()
+        # Libera a câmera para que o thread 'run' possa usá-la
+        if self.cap:
+            self.cap.release()
+            self.cap = None
 
     def save_calibration(self):
         """
