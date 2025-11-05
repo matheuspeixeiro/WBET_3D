@@ -47,31 +47,35 @@ class NotepadFrame(tk.Frame):
 
         self._focusable_widgets.extend([btn_novo, btn_salvar])
 
-        # 2b. Área de Texto
+        # 2c. Teclado Virtual (VEM PRIMEIRO)
+        keyboard_frame = tk.Frame(content_frame, bg=self.cor_fundo, pady=10)
+        # Garanta que "side='bottom'" esteja aqui
+        keyboard_frame.pack(fill="x", side="bottom")
+        self._build_virtual_keyboard(keyboard_frame)
+
+        # 2b. Área de Texto (VEM DEPOIS)
         text_frame = tk.Frame(content_frame, bg="white", borderwidth=2, relief="solid")
+        # Este "expand=True" agora só vai preencher o espaço que sobrou
         text_frame.pack(fill="both", expand=True)
 
+        # --- Bloco Faltante Adicionado ---
         # O controller armazena a referência ao widget
         self.controller.notepad_text_widget = tk.Text(text_frame, wrap="word", font=("Arial", 20),
-                                                      undo=True, bg="white", fg="black",
-                                                      insertbackground="black", relief="flat")
+                                                   undo=True, bg="white", fg="black",
+                                                   insertbackground="black", relief="flat")
         self.controller.notepad_text_widget.pack(fill="both", expand=True, padx=10, pady=10)
         self._focusable_widgets.append(self.controller.notepad_text_widget)
 
         # Preenche com o conteúdo "não salvo"
         if self.controller.notepad_last_save_content and self.controller.notepad_is_dirty:
-            self.controller.notepad_text_widget.insert("1.0", self.controller.notepad_last_save_content)
+             self.controller.notepad_text_widget.insert("1.0", self.controller.notepad_last_save_content)
         else:
             self.controller.notepad_last_save_content = ""
 
         # Rastreia alterações
         self.controller.notepad_text_widget.bind("<<Modified>>",
-                                                 self.controller._on_notepad_modified)
-
-        # 2c. Teclado Virtual
-        keyboard_frame = tk.Frame(content_frame, bg=self.cor_fundo, pady=10)
-        keyboard_frame.pack(fill="x", side="bottom")
-        self._build_virtual_keyboard(keyboard_frame)
+                                                self.controller._on_notepad_modified)
+        # --- Fim do Bloco Faltante ---
 
         # --- 3. Barra de Status (Inferior) ---
         bottom_bar = tk.Frame(self, bg=self.cor_fundo)
@@ -108,11 +112,24 @@ class NotepadFrame(tk.Frame):
     def _build_virtual_keyboard(self, parent_frame):
         """Cria e exibe o teclado virtual."""
 
-        key_style = {"font": ("Arial", 16), "bg": "#333", "fg": "white",
-                     "activebackground": "#555", "activeforeground": "white",
-                     "relief": "solid", "borderwidth": 1, "width": 4, "height": 1,
-                     "padx": 5, "pady": 5}
+        # --- CORREÇÃO DE ESTILO ---
+        # Estilo "Claro" que o macOS respeita.
+        # Removemos width/height para que o layout seja responsivo.
+        key_style = {"font": ("Arial", 16),
+                     "bg": "#EEEEEE",  # Fundo cinza-claro
+                     "fg": "black",  # Texto preto (VISÍVEL)
+                     "activebackground": "#CCCCCC",
+                     "activeforeground": "black",
+                     "relief": "flat",
+                     "borderwidth": 1,
+                     "padx": 10, "pady": 10}  # Aumenta o padding interno
 
+        # Estilo para teclas especiais (Shift, Enter, etc.)
+        special_key_style = key_style.copy()
+        special_key_style["bg"] = "#CCCCCC"  # Cinza um pouco mais escuro
+        # --- FIM DA CORREÇÃO DE ESTILO ---
+
+        # Layout das teclas (QWERTY)
         key_rows = [
             ['`', '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 'Backspace'],
             ['Tab', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\\'],
@@ -123,24 +140,31 @@ class NotepadFrame(tk.Frame):
 
         for r_idx, row in enumerate(key_rows):
             row_frame = tk.Frame(parent_frame, bg=parent_frame.cget("bg"))
-            row_frame.pack()
+            # --- CORREÇÃO DE LAYOUT ---
+            # Faz a 'linha' (row_frame) preencher a largura
+            row_frame.pack(fill="x")
 
             for key_char in row:
-                btn = tk.Button(row_frame, text=key_char, **key_style)
 
-                # O comando chama um método desta classe
+                # Escolhe o estilo (especial ou normal)
+                is_special = len(key_char) > 1 or not key_char.isalnum()
+                style_to_use = special_key_style if is_special else key_style
+
+                btn = tk.Button(row_frame, text=key_char, **style_to_use)
+
+                # --- Lógica de Comando ---
                 cmd = lambda char=key_char: self._on_key_press(char)
                 btn.configure(command=cmd)
 
-                if key_char == 'Space':
-                    btn.configure(width=60)
-                elif key_char in ['Backspace', 'Enter', 'Shift', 'Caps', 'Tab']:
-                    btn.configure(width=8, bg="#555")
+                # --- Lógica de Tamanho REMOVIDA ---
+                # (Não precisamos mais de width=60 ou width=8)
 
-                btn.pack(side="left", padx=2, pady=2)
+                # --- CORREÇÃO DE LAYOUT ---
+                # Faz os 'botões' preencherem a 'linha' e se expandirem
+                btn.pack(side="left", fill="x", expand=True, padx=2, pady=2)
                 self._focusable_widgets.append(btn)
 
-                # O controller armazena as referências
+                # Guarda referência dos botões de estado
                 if key_char == 'Shift':
                     self.controller.shift_btn_ref = btn
                 if key_char == 'Caps':
@@ -167,13 +191,13 @@ class NotepadFrame(tk.Frame):
         # 2. Teclas Modificadoras (Atualiza o estado no controller)
         elif key_char == 'Shift':
             self.controller.sticky_shift_active = not self.controller.sticky_shift_active
-            new_color = "#1E88E5" if self.controller.sticky_shift_active else "#555"
+            new_color = "#1E88E5" if self.controller.sticky_shift_active else "#CCCCCC" # Corrigido para estilo claro
             if hasattr(self.controller, "shift_btn_ref"):
                 self.controller.shift_btn_ref.configure(bg=new_color)
 
         elif key_char == 'Caps':
             self.controller.caps_lock_active = not self.controller.caps_lock_active
-            new_color = "#1E88E5" if self.controller.caps_lock_active else "#555"
+            new_color = "#1E88E5" if self.controller.caps_lock_active else "#CCCCCC" # Corrigido para estilo claro
             if hasattr(self.controller, "caps_btn_ref"):
                 self.controller.caps_btn_ref.configure(bg=new_color)
 
@@ -193,7 +217,7 @@ class NotepadFrame(tk.Frame):
             if self.controller.sticky_shift_active:
                 self.controller.sticky_shift_active = False
                 if hasattr(self.controller, "shift_btn_ref"):
-                    self.controller.shift_btn_ref.configure(bg="#555")
+                    self.controller.shift_btn_ref.configure(bg="#CCCCCC") # Corrigido para estilo claro
 
         widget.focus_set()
         widget.event_generate("<<Modified>>")
