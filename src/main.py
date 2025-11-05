@@ -29,6 +29,9 @@ GAZE_MOVE_DELAY = 5
 GAZE_STABILITY_DELAY = 1.5
 GAZE_TOLERANCE_PX = 80
 SCAN_DELAY_SECONDS = 3.0  # Tempo de varredura (3 segundos)
+# --- CONSTANTES FASE 4 (BOOST) ---
+SCAN_BOOST_DELAY_SECONDS = 0.1  # Velocidade do boost (100ms)
+SCAN_BOOST_PRE_TIMER_SECONDS = 3.0 # 3s de olho fechado para ATIVAR
 
 
 # --- CLASSE PRINCIPAL (CONTROLLER) ---
@@ -69,16 +72,20 @@ class App(tk.Tk):
         self.scan_key_list = []           # Lista de teclas em ordem
         self.scan_index = -1              # Índice da tecla selecionada
         self.last_scan_time = 0           # Timer para o scanner
+        # --- Timers de Dwell (Fase 3 e 4) ---
         self.is_dwell_clicking = False    # Pausa o scanner
         self.dwell_start_time = 0         # Timer da piscada de 2s
-        self.blink_pre_dwell_start_time = 0 # <-- NOVO: Timer da piscada de 1s
+        self.blink_pre_dwell_start_time = 0 # Timer da piscada de 1s
+        self.is_boost_pre_dwelling = False    # Timer de 3s do boost
+        self.is_boost_active = False          # Boost está ATIVO
+        self.boost_pre_dwell_start_time = 0   # Timer de 3s do boost
 
         # --- Estado de Clique (Substitui click_request) ---
         self.blink_state = "IDLE" # IDLE, PRE_LOCKED, LOCKED
         self.blink_start_time = 0
         self.BLINK_CLICK_DURATION_DASHBOARD = 1.0 # O 1seg antigo
-        self.BLINK_CLICK_DURATION_SCANNER = 0.3   
-        self.SCAN_DWELL_PRE_TIMER_SECONDS = 0.7   
+        self.BLINK_CLICK_DURATION_SCANNER = 0.3   # 0.3s (seu valor)
+        self.SCAN_DWELL_PRE_TIMER_SECONDS = 0.7   # 0.7s (seu valor)
 
         # --- CONSTANTES DE COR DO SCANNER ---
         self.KEY_STYLE_BG = "#EEEEEE"
@@ -635,70 +642,103 @@ class App(tk.Tk):
             except: pass 
                 
         self.scan_index = -1
+        # Reseta todos os timers de scanner
         self.is_dwell_clicking = False
         self.blink_pre_dwell_start_time = 0
+        self.is_boost_pre_dwelling = False
+        self.is_boost_active = False
+        self.boost_pre_dwell_start_time = 0
+
 
     def _handle_scan_mode(self):
-        """Lógica principal do modo de varredura (Fases 2 e 3)."""
+        """Lógica principal do modo de varredura (Fases 2, 3 e 4)."""
         
         now = time.time()
         
-        # --- LÓGICA FASE 3: CHECA PISCADA ---
+        # --- 1. Read States ---
         is_blinking = False
+        is_boosting = False # Right-eye-only
         lock = self.shared_state.get("_lock")
         if lock:
             with lock:
                 is_blinking = self.shared_state.get("is_blinking", False)
+                is_boosting = self.shared_state.get("is_boosting", False)
         else:
-            return 
+            return # Sai se o lock não estiver disponível
 
+        # --- 2. Handle Click (Phase 3) - HIGHEST PRIORITY ---
         if is_blinking:
-            # --- Inicia o pré-timer (1s) ---
+            # Reseta o boost se o usuário piscar com os dois olhos
+            self.is_boost_pre_dwelling = False
+            self.is_boost_active = False
+            self.boost_pre_dwell_start_time = 0
+            
+            # Inicia o pré-timer (0.7s)
             if self.blink_pre_dwell_start_time == 0:
                 self.blink_pre_dwell_start_time = time.time()
 
-            # --- Checa se o Dwell (pausa) deve ser ativado ---
-            if not self.is_dwell_clicking and (time.time() - self.blink_pre_dwell_start_time) >= self.SCAN_DWELL_PRE_TIMER_SECONDS:
+            # Checa se o Dwell (pausa) deve ser ativado
+            if not self.is_dwell_clicking and (now - self.blink_pre_dwell_start_time) >= self.SCAN_DWELL_PRE_TIMER_SECONDS:
                 self.is_dwell_clicking = True
                 self.dwell_start_time = time.time()
-                print("[Scanner] Dwell (1s) detectado. Pausando scan.")
+                print(f"[Scanner] Dwell ({self.SCAN_DWELL_PRE_TIMER_SECONDS}s) detectado. Pausando scan.")
             
-            # --- Se o Dwell ESTÁ ativo, checa o clique (2s) ---
+            # Se o Dwell ESTÁ ativo, checa o clique (0.3s)
             if self.is_dwell_clicking:
-                if (time.time() - self.dwell_start_time) >= self.BLINK_CLICK_DURATION_SCANNER:
-                    print("[Scanner] CLIQUE (2s)!")
+                if (now - self.dwell_start_time) >= self.BLINK_CLICK_DURATION_SCANNER:
+                    print(f"[Scanner] CLIQUE ({self.BLINK_CLICK_DURATION_SCANNER}s)!")
                     if 0 <= self.scan_index < len(self.scan_key_list):
                         try:
                             key = self.scan_key_list[self.scan_index]
                             key.invoke()
                         except: pass
                     
+                    # Reseta tudo para o próximo clique
                     self.is_dwell_clicking = False
                     self.dwell_start_time = 0
                     self.blink_pre_dwell_start_time = 0
-                    self.last_scan_time = time.time()
-                    self.just_clicked_time = time.time()
+                    self.last_scan_time = time.time() # Reseta o scanner de 3s
+                    self.just_clicked_time = time.time() # Ativa o congelamento de 5s
             
             # Se está piscando (em pré-timer ou dwell), não avança o scanner.
             return 
 
-        else: # Não está piscando (olhos abertos)
-            if self.is_dwell_clicking:
-                print("[Scanner] Clique cancelado (abriu os olhos).")
-                self.is_dwell_clicking = False
-                self.dwell_start_time = 0
-                self.last_scan_time = time.time() # Resume o scanner
+        # --- 3. Handle Boost (Phase 4) - SECOND PRIORITY ---
+        current_scan_delay = SCAN_DELAY_SECONDS # Default to slow
+        
+        if is_boosting:
+            # Reseta timers de clique
+            self.blink_pre_dwell_start_time = 0
+            self.is_dwell_clicking = False
             
-            # Reseta o pré-timer se a piscada foi involuntária
-            if self.blink_pre_dwell_start_time > 0:
-                self.blink_pre_dwell_start_time = 0
-        # --- FIM DA LÓGICA FASE 3 ---
+            # Start pre-dwell timer for boost (3s)
+            if not self.is_boost_pre_dwelling:
+                print(f"[Scanner] Boost detectado. Iniciando timer de {SCAN_BOOST_PRE_TIMER_SECONDS}s...")
+                self.is_boost_pre_dwelling = True
+                self.boost_pre_dwell_start_time = time.time()
+            
+            # Check if pre-dwell is complete
+            if (now - self.boost_pre_dwell_start_time) >= SCAN_BOOST_PRE_TIMER_SECONDS:
+                self.is_boost_active = True
+            
+            if self.is_boost_active:
+                current_scan_delay = SCAN_BOOST_DELAY_SECONDS # Set to fast
+                
+        else: # Olhos abertos (nem piscando, nem boost)
+            # Reseta todos os timers
+            self.blink_pre_dwell_start_time = 0
+            self.is_dwell_clicking = False
+            if self.is_boost_pre_dwelling or self.is_boost_active:
+                 print("[Scanner] Boost desativado.")
+            self.is_boost_pre_dwelling = False
+            self.is_boost_active = False
+            self.boost_pre_dwell_start_time = 0
+            current_scan_delay = SCAN_DELAY_SECONDS # Garante que está lento
 
-        # --- Lógica do Scanner (Fase 2) ---
-        # SÓ avança o scanner se NÃO estivermos no meio de um clique
-        if (now - self.last_scan_time) >= SCAN_DELAY_SECONDS:
+        # --- 4. Handle Scan (Phase 2) - LAST PRIORITY ---
+        if (now - self.last_scan_time) >= current_scan_delay:
             
-            # 3a. Remove o destaque da tecla anterior
+            # 4a. Remove o destaque da tecla anterior
             if 0 <= self.scan_index < len(self.scan_key_list):
                 try:
                     key = self.scan_key_list[self.scan_index]
@@ -716,14 +756,14 @@ class App(tk.Tk):
                     )
                 except: pass 
             
-            # 3b. Avança o índice
+            # 4b. Avança o índice
             self.scan_index += 1
             
-            # 3c. Loopa de volta ao início
+            # 4c. Loopa de volta ao início
             if self.scan_index >= len(self.scan_key_list):
                 self.scan_index = 0
                 
-            # 3d. Adiciona destaque à nova tecla
+            # 4d. Adiciona destaque à nova tecla
             if 0 <= self.scan_index < len(self.scan_key_list):
                 try:
                     new_key = self.scan_key_list[self.scan_index]
@@ -733,7 +773,7 @@ class App(tk.Tk):
                     )
                 except: pass
             
-            # 3e. Reseta o timer
+            # 4e. Reseta o timer
             self.last_scan_time = time.time()
 
 
@@ -982,7 +1022,10 @@ class App(tk.Tk):
         self.last_scan_time = 0
         self.is_dwell_clicking = False
         self.dwell_start_time = 0
-        self.blink_pre_dwell_start_time = 0 # <-- NOVO
+        self.blink_pre_dwell_start_time = 0
+        self.is_boost_pre_dwelling = False # <-- NOVO
+        self.is_boost_active = False       # <-- NOVO
+        self.boost_pre_dwell_start_time = 0 # <-- NOVO
         
         # Reseta o estado de clique do dashboard
         self.blink_state = "IDLE"

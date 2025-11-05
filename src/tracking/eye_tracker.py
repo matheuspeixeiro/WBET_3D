@@ -15,7 +15,6 @@ class EyeTracker(threading.Thread):
     RIGHT_EYE_OUTLINE_IDX = [133, 160, 158, 33, 153, 144]
 
     EAR_THRESHOLD = 0.2
-    # BLINK_CLICK_DURATION foi movido para o main.py
 
     def __init__(self, camera_index: int = 0, shared_state: dict = None):
         super().__init__(daemon=True, name="EyeTrackerThread")
@@ -55,7 +54,6 @@ class EyeTracker(threading.Thread):
         if not self.cap or not self.cap.isOpened():
             self.cap = cv2.VideoCapture(self.camera_index)
         
-        # Garante que a captura foi bem-sucedida
         if not self.cap.isOpened():
             print(f"ERRO: Não foi possível abrir a câmera índice {self.camera_index}")
             self.running = False
@@ -78,6 +76,7 @@ class EyeTracker(threading.Thread):
 
             # --- DADOS PADRÃO PARA O SHARED_STATE ---
             current_is_blinking = False
+            current_is_boosting = False # <-- NOVO (FASE 4)
 
             if results.multi_face_landmarks:
                 landmarks = results.multi_face_landmarks[0].landmark
@@ -109,11 +108,18 @@ class EyeTracker(threading.Thread):
                     last_valid_gaze = (screen_x, screen_y, raw_yaw, raw_pitch, 1.0)
                     gaze_is_valid = True
 
-                # --- LÓGICA DE PISCADA SIMPLIFICADA (FASE 3) ---
+                # --- LÓGICA DE PISCADA ATUALIZADA (FASES 3 e 4) ---
                 left_ear = self._compute_ear(landmarks, self.LEFT_EYE_OUTLINE_IDX)
                 right_ear = self._compute_ear(landmarks, self.RIGHT_EYE_OUTLINE_IDX)
-                avg_ear = (left_ear + right_ear) / 2.0
-                current_is_blinking = avg_ear < self.EAR_THRESHOLD
+                
+                is_left_blinking = left_ear < self.EAR_THRESHOLD
+                is_right_blinking = right_ear < self.EAR_THRESHOLD
+
+                # Fase 3: Clique = AMBOS os olhos fechados
+                current_is_blinking = is_left_blinking and is_right_blinking
+                
+                # Fase 4: Boost = SÓ o olho direito fechado
+                current_is_boosting = is_right_blinking and (not is_left_blinking)
                 # --- FIM DA LÓGICA DE PISCADA ---
 
             # --- ATUALIZA O ESTADO COMPARTILHADO ---
@@ -121,8 +127,8 @@ class EyeTracker(threading.Thread):
                 if gaze_is_valid:
                     self.shared_state["gaze"] = last_valid_gaze
                 
-                # Envia o estado da piscada continuamente
                 self.shared_state["is_blinking"] = current_is_blinking
+                self.shared_state["is_boosting"] = current_is_boosting # <-- NOVO
 
             time.sleep(0.001)
 
@@ -228,7 +234,6 @@ class EyeTracker(threading.Thread):
                     print("[Calibração] Centro da tela calibrado.")
 
         cv2.destroyAllWindows()
-        # Libera a câmera para que o thread 'run' possa usá-la
         if self.cap:
             self.cap.release()
             self.cap = None
