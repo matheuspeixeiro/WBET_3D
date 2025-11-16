@@ -12,11 +12,13 @@ import screeninfo
 import cv2
 import time
 import os
+import pygame
 
 # --- Importações das Views ---
 from ui.dashboard_view import DashboardFrame
 from ui.calibrator_view import CalibratorFrame
 from ui.notepad_view import NotepadFrame
+from ui.calibration_screen_view import CalibrationScreenFrame
 
 from tracking.eye_tracker import EyeTracker
 from tracking import calibration
@@ -30,9 +32,12 @@ GAZE_STABILITY_DELAY = 1.5
 GAZE_TOLERANCE_PX = 80
 SCAN_DELAY_SECONDS = 3.0  # Tempo de varredura (3 segundos)
 # --- CONSTANTES FASE 4 (BOOST) ---
-SCAN_BOOST_DELAY_SECONDS = 0.1  # Velocidade do boost (100ms)
+SCAN_BOOST_DELAY_SECONDS = 0.5  # Velocidade do boost (100ms)
 SCAN_BOOST_PRE_TIMER_SECONDS = 3.0 # 3s de olho fechado para ATIVAR
-
+# --- CONSTANTES DE AUDIO ---
+SOUND_DIR = "resources/sounds"
+MOUSE_CLICK_SOUND = os.path.join(SOUND_DIR, "mouse_click.mp3")
+KEY_TAP_SOUND = os.path.join(SOUND_DIR, "key_tap.mp3")
 
 # --- CLASSE PRINCIPAL (CONTROLLER) ---
 class App(tk.Tk):
@@ -46,6 +51,9 @@ class App(tk.Tk):
         self.last_stable_time = time.time()
         self.last_cursor_pos = None
         self.just_clicked_time = 0
+        self.current_profile_name = "N/A"
+        self.calib_step = "START" # Estado: START, C, S, DONE
+        self.current_camera_index = 0
 
         self.title("Assistente de Acessibilidade Ocular")
         self.configure(bg="#222")
@@ -124,11 +132,12 @@ class App(tk.Tk):
         self.icon_notepad = None
         self._load_sidebar_icons()
 
+        self._init_audio()
+
         # Tela inicial
         self._build_startup_frame()
 
     # -------- Utilidades de Hardware/OS ----------
-
     def _get_monitores_com_fallback(self):
         try:
             mons = screeninfo.get_monitors()
@@ -193,6 +202,36 @@ class App(tk.Tk):
             self.icon_notepad = ImageTk.PhotoImage(img)
         except Exception as e:
             print(f"Erro ao carregar ícone 'notepad' para sidebar: {e}")
+
+    def _init_audio(self):
+        """Inicializa o mixer do pygame e carrega os sons."""
+        self._mouse_click_sound = None
+        self._key_tap_sound = None
+        try:
+            pygame.mixer.init()
+            # Carrega sons
+            self._mouse_click_sound = pygame.mixer.Sound(MOUSE_CLICK_SOUND)
+            self._key_tap_sound = pygame.mixer.Sound(KEY_TAP_SOUND)
+            # Define canais (Garante que cliques e teclas não se bloqueiem)
+            pygame.mixer.set_num_channels(2)
+            self._mouse_channel = pygame.mixer.Channel(0) # Canal 0 para cliques
+            self._key_channel = pygame.mixer.Channel(1)   # Canal 1 para teclas
+            print("[Audio] Sons carregados com sucesso.")
+        except pygame.error as e:
+            print(f"[Audio] ERRO ao inicializar ou carregar sons: {e}")
+        except Exception as e:
+            print(f"[Audio] ERRO genérico ao carregar áudio: {e}")
+
+    def play_sound(self, sound_type: str):
+        """Reproduz um som usando canais dedicados para não bloquear a UI ou outros sons."""
+        if sound_type == 'mouse' and self._mouse_click_sound:
+            # Toca o som do mouse no Canal 0
+            if not self._mouse_channel.get_busy(): # Use get_busy() no canal
+                threading.Thread(target=self._mouse_channel.play, args=(self._mouse_click_sound,), daemon=True).start()
+        elif sound_type == 'key' and self._key_tap_sound:
+            # Toca o som da tecla no Canal 1
+            if not self._key_channel.get_busy(): # Use get_busy() no canal
+                 threading.Thread(target=self._key_channel.play, args=(self._key_tap_sound,), daemon=True).start()
 
     # --------- UI: Tela inicial (Startup) ----------
     # (Esta é a única UI construída diretamente no main)
@@ -335,6 +374,10 @@ class App(tk.Tk):
 
     def create_calibrator_view(self):
         """Navega para a View de Calibração."""
+        if self.tracker:
+            self.tracker.stop()
+            self.tracker = None
+        
         self._clear_root()
         self.configure(bg="#222")
 
@@ -418,26 +461,102 @@ class App(tk.Tk):
         if not profile_name:
             return
 
-        messagebox.showinfo(
-            "Instruções",
-            "Pressione 'C' para travar, 'S' para calibrar o centro, e 'Q' para sair."
-        )
+        self.current_profile_name = profile_name # Salva o nome para a UI
+        self.calib_step = "C" # Define o próximo passo
 
-        self._clear_root()  # Limpa a tela de calibração
+        # 1. Limpa a tela de seleção de perfil
+        self._clear_root() 
+        
+        # 2. Inicia o tracker em SEGUNDO PLANO
+        self.tracker = EyeTracker(camera_index=self.current_camera_index, shared_state=self.shared_state)
+        self.tracker.start() # A thread 'run()' começa a processar frames
 
-        self.tracker = EyeTracker(camera_index=camera_index, shared_state=self.shared_state)
-        mon = self.get_active_monitor()
-        self.tracker.start_debug_window(window_pos=(mon.x + 80, mon.y + 80))
+        # 3. Navega para a NOVA tela de calibração (ponto verde)
+        self.create_calibration_screen_view()
+
+    def create_calibration_screen_view(self):
+        """Navega para a View de Calibração ATIVA (ponto verde)."""
+        self._clear_root()
+        self.configure(bg="black") # Fundo preto
+        
+        # Maximiza a tela para a calibração
+        self.move_root_to_monitor(self.selected_monitor_index, fullscreen_like=True)
+        self.attributes('-fullscreen', True) # Força tela cheia
+
+        calib_screen = CalibrationScreenFrame(self, controller=self)
+        calib_screen.pack(fill="both", expand=True)
+
+        self.current_screen = calib_screen
+        self.focusable_widgets = [] # Sem snap-to-object aqui
+        self.protocol("WM_DELETE_WINDOW", self.quit_app)
+
+    def get_calib_frame_data(self):
+        """Chamado pela UI de calibração para obter o preview."""
+        if self.tracker:
+            return self.tracker.get_latest_frame_and_status()
+        return None, False
+    
+    def update_calib_ui(self, face_detected, instruction_label, action_button):
+        """Controla o estado da UI de calibração (botões e texto)."""
+        if not face_detected:
+            instruction_label.config(text="Rosto não detectado.\nPosicione-se de frente para a câmera.")
+            action_button.config(state="disabled", text="...")
+            return
+
+        if self.calib_step == "C":
+            instruction_label.config(text="Olhe fixamente para o '+' no centro da tela e clique no botão abaixo.")
+            action_button.config(text="1. Fixar Posição dos Olhos", state="normal")
+        elif self.calib_step == "S":
+            instruction_label.config(text="Continue olhando para o '+' e clique no botão para finalizar a calibração.")
+            action_button.config(text="2. Calibrar Centro da Tela", state="normal")
+        elif self.calib_step == "DONE":
+             instruction_label.config(text="Calibração concluída! Salvando perfil...")
+             action_button.config(text="Concluído", state="disabled")
+
+    def on_calib_button_click(self):
+        """Chamado quando o botão principal da tela de calibração é clicado."""
+        if not self.tracker:
+            return
+
+        if self.calib_step == "C":
+            self.tracker.trigger_calibration_step('C')
+            self.calib_step = "S" # Avança para o próximo passo
+        
+        elif self.calib_step == "S":
+            self.tracker.trigger_calibration_step('S')
+            self.calib_step = "DONE" # Finaliza
+            
+            # Espera 1 segundo para o usuário ler "Concluído"
+            self.after(1000, self.finish_calibration)
+    
+    def finish_calibration(self):
+        """Salva os dados e navega para o dashboard."""
+        if not self.tracker:
+            return
 
         calib_data = self.tracker.save_calibration()
         if calib_data:
             calib_data["monitor_index"] = self.selected_monitor_index
-            calib_data["camera_index"] = camera_index
-            calibration.save_profile(profile_name, calib_data)
+            calib_data["camera_index"] = self.current_camera_index
+            calibration.save_profile(self.current_profile_name, calib_data)
+        
+        self.tracker.loaded_profile_name = self.current_profile_name
+        
+        # Sai do modo tela cheia
+        self.attributes('-fullscreen', False)
+        self.create_dashboard() # Navega para o Dashboard
 
-        self.tracker.start()
-        self.tracker.loaded_profile_name = profile_name
-        self.create_dashboard()  # Navega para o Dashboard
+    def cancel_calibration(self):
+        """Chamado pelo botão 'Cancelar' na tela de calibração."""
+        print("Calibração cancelada pelo usuário.")
+        if self.tracker:
+            self.tracker.stop()
+            self.tracker = None
+            
+        # Sai do modo tela cheia
+        self.attributes('-fullscreen', False)
+        # Volta para a tela de seleção de perfil
+        self.create_calibrator_view()
 
     def _ask_profile_name(self, monitor):
         """Diálogo customizado para nome do perfil."""
@@ -807,7 +926,7 @@ class App(tk.Tk):
             if self.just_clicked_time and (now - self.just_clicked_time < GAZE_MOVE_DELAY):
                 self._update_loop_job = self.after(50, self.update_loop)
                 return
-            self.just_clicked_time = 0
+            self.just_clicked_time = 0 # Reseta o congelamento de 5s
 
             lock = self.shared_state.get("_lock")
             if lock is None:
@@ -816,75 +935,84 @@ class App(tk.Tk):
                 
             self.is_navigating = False # Reseta o flag
 
-            # 2. Pega clique (Lógica do Dashboard)
-            click_request = False # Flag de clique para este ciclo
+            # 2. LÊ O ESTADO DE PISCADA IMEDIATAMENTE (O NOVO PONTO DE CONGELAMENTO)
             is_blinking = False
+
+            click_request = False
+
             with lock:
                 is_blinking = self.shared_state.get("is_blinking", False)
 
+            # --- LÓGICA DE ESTADO DE CLIQUE (IDLE, PRE_LOCKED, LOCKED) ---
+            # ATUALIZA o estado de clique:
             if self.blink_state == "IDLE":
                 if is_blinking:
                     self.blink_state = "PRE_LOCKED"
                     self.blink_start_time = time.time()
+                    # AQUI: Se for um widget snapável, move o mouse para o centro 
+                    # do snap AGORA para travar antes que o olhar se perca.
+                    if self.currently_snapped_widget:
+                         widget = self.currently_snapped_widget
+                         pyautogui.moveTo(
+                            widget.winfo_rootx() + widget.winfo_width() / 2,
+                            widget.winfo_rooty() + widget.winfo_height() / 2,
+                            duration=0.05 # Move bem rápido
+                        )
+
             elif self.blink_state == "PRE_LOCKED":
-                if not is_blinking: # Abriu os olhos
+                if not is_blinking: # Abriu os olhos: CANCELA
                     self.blink_state = "IDLE"
                 elif (time.time() - self.blink_start_time) > self.BLINK_CLICK_DURATION_DASHBOARD:
+                    # CLIQUE DETECTADO
                     click_request = True
-                    self.blink_state = "LOCKED" # Espera abrir os olhos
+                    self.blink_state = "LOCKED" # Vai para LOCKED (espera abrir o olho)
+            
             elif self.blink_state == "LOCKED":
-                if not is_blinking: # Abriu os olhos
+                if not is_blinking: # Abriu os olhos: RESETA
                     self.blink_state = "IDLE"
-            # --- FIM DA LÓGICA DE CLIQUE ---
-
-            # 3. Processa clique (Modo Snap)
+            
+            # 3. Processa o CLIQUE e sai (prioridade máxima)
             if click_request and self.currently_snapped_widget:
                 widget = self.currently_snapped_widget
                 
-                widget_info = ""
-                if isinstance(widget, (tk.Button, tk.Label)):
-                    try: widget_info = widget.cget('text')
-                    except Exception: widget_info = str(widget)
-                elif isinstance(widget, tk.Text):
-                    widget_info = "Área de Texto"
-                else:
-                    widget_info = str(widget)
-                print(f"[EyeTracker] Clique ocular em: {widget_info}")
-
-                # Feedback visual
-                try:
-                    original_color = widget.cget("highlightbackground")
-                    widget.configure(highlightbackground="#00ff88", highlightthickness=8)
-                    widget.after(150,
-                                 lambda: widget.configure(highlightbackground=original_color, highlightthickness=6))
-                except: pass
-
-                # (Não precisamos mais do lock para 'click_request')
-
+                # --- NOVO BLOCO DE ÁUDIO ---
+                # Garante que o som é tocado antes de executar o comando
+                self.play_sound('mouse') 
+                # ---------------------------
+                
                 # Executa ação
                 try:
+                    # Se for um widget Tkinter (dashboard, config)
                     widget.invoke()
                 except tk.TclError:
-                    # Se não for botão (ex: tk.Text), apenas foca
                     widget.focus_set()
                 except Exception as e:
                     print(f"[EyeTracker] Erro no clique ocular (invoke): {e}")
                 
                 if self.is_navigating:
+                    self._update_loop_job = self.after(50, self.update_loop)
                     return
                 
                 pyautogui.click()
-                self.just_clicked_time = time.time()
+                self.just_clicked_time = time.time() # Congela por GAZE_MOVE_DELAY
+                self.blink_state = "IDLE" # Garante reset
                 
                 self._update_loop_job = self.after(50, self.update_loop)
                 return
 
-            # 4. Limpa clique (se não usado)
-            # (Não é mais necessário, click_request é local)
 
-            # 5. Processa movimento do olhar
+            # 4. CONGELAMENTO IMEDIATO DO MOVIMENTO:
+            # Se a intenção de clique (PRE_LOCKED ou LOCKED) estiver ativa, PULA toda a lógica de movimento.
+            if self.blink_state != "IDLE":
+                self._update_loop_job = self.after(50, self.update_loop)
+                return
+            
+            # 5. Processa movimento do olhar (Snap e Free-Move) - SÓ se blink_state == IDLE
+            if self.blink_state != "IDLE":
+                self._update_loop_job = self.after(50, self.update_loop)
+                return
+
             with lock:
-                # O 'gaze_frozen' não existe mais
                 gaze_data = self.shared_state.get("gaze")
             
             if gaze_data:
@@ -893,9 +1021,10 @@ class App(tk.Tk):
                 final_gaze_x = gaze_x + mon.x
                 final_gaze_y = gaze_y + mon.y
 
-                # Lógica de Snap
+                # Lógica de Snap (Permanece a mesma)
                 closest_widget, min_dist_sq = None, float("inf")
-                
+                was_snapped = False
+
                 if not self.focusable_widgets:
                     self._update_loop_job = self.after(50, self.update_loop)
                     return
@@ -913,8 +1042,9 @@ class App(tk.Tk):
                 # Aplica Snap/Highlight
                 if closest_widget and min_dist_sq ** 0.5 <= SNAP_THRESHOLD_PIXELS:
                     if closest_widget != self.currently_snapped_widget:
-                        
-                        # Ativa o Modo de Varredura
+                        was_snapped = True
+
+                        # Ativa o Modo de Varredura (se for o teclado)
                         if closest_widget == self.keyboard_frame_widget:
                             print("[Scanner] Gaze entrou no teclado. Ativando.")
                             self.scan_mode_active = True
@@ -933,49 +1063,36 @@ class App(tk.Tk):
                             self._update_loop_job = self.after(50, self.update_loop)
                             return 
                         
-                        pyautogui.moveTo(
-                            closest_widget.winfo_rootx() + closest_widget.winfo_width() / 2,
-                            closest_widget.winfo_rooty() + closest_widget.winfo_height() / 2,
-                            duration=0.1
-                        )
-                        # Remove highlight antigo
-                        if self.currently_snapped_widget and self.currently_snapped_widget.winfo_exists():
-                            try:
-                                if isinstance(self.currently_snapped_widget, tk.Text):
-                                    self.currently_snapped_widget.configure(highlightbackground="white", highlightthickness=2)
-                                else:
-                                    self.currently_snapped_widget.configure(highlightbackground="#0b4073", highlightthickness=3)
-                            except: pass
-                        # Adiciona highlight novo
-                        if closest_widget.winfo_exists():
-                            try:
-                                if isinstance(closest_widget, tk.Text):
-                                    closest_widget.configure(highlightbackground="#00ff00", highlightthickness=4)
-                                else:
-                                    closest_widget.configure(highlightbackground="#00ff00", highlightthickness=6)
-                            except: pass
-                        self.currently_snapped_widget = closest_widget
+                        if closest_widget != self.currently_snapped_widget:
+                            pyautogui.moveTo(
+                                closest_widget.winfo_rootx() + closest_widget.winfo_width() / 2,
+                                closest_widget.winfo_rooty() + closest_widget.winfo_height() / 2,
+                                duration=0.1
+                            )
+                            
+                            # Remove highlight antigo
+                            if self.currently_snapped_widget and self.currently_snapped_widget.winfo_exists():
+                                try:
+                                    if isinstance(self.currently_snapped_widget, tk.Text):
+                                        self.currently_snapped_widget.configure(highlightbackground="white", highlightthickness=2)
+                                    else:
+                                        self.currently_snapped_widget.configure(highlightbackground="#0b4073", highlightthickness=3)
+                                except: pass
+                            
+                            # Adiciona highlight novo
+                            if closest_widget.winfo_exists():
+                                try:
+                                    if isinstance(closest_widget, tk.Text):
+                                        closest_widget.configure(highlightbackground="#00ff00", highlightthickness=4)
+                                    else:
+                                        closest_widget.configure(highlightbackground="#00ff00", highlightthickness=6)
+                                except: pass
+                                
+                            self.currently_snapped_widget = closest_widget
                 
-                # Lógica de Free-Move (sem snap)
-                else:
-                    # O 'gaze_frozen' não existe mais, então o free-move está sempre ativo
-                    now = time.time()
-                    gaze_point = (final_gaze_x, final_gaze_y)
-                    if self.last_gaze_pos is None:
-                        self.last_gaze_pos = gaze_point
-                        self.last_stable_time = now
-
-                    dist = ((gaze_point[0] - self.last_gaze_pos[0]) ** 2 + (
-                                gaze_point[1] - self.last_gaze_pos[1]) ** 2) ** 0.5
-
-                    if dist > GAZE_TOLERANCE_PX:
-                        self.last_gaze_pos = gaze_point
-                        self.last_stable_time = now
-                    elif now - self.last_stable_time >= GAZE_STABILITY_DELAY:
-                        pyautogui.moveTo(gaze_point[0], gaze_point[1], duration=0.1)
-                        self.last_cursor_pos = gaze_point
+                else: # O olhar não está perto de nenhum Snap
                     
-                    # Remove highlight ao sair do foco
+                    # 5b. Remove highlight ao sair do foco
                     if self.currently_snapped_widget and self.currently_snapped_widget.winfo_exists():
                         try:
                             if isinstance(self.currently_snapped_widget, tk.Text):
@@ -984,6 +1101,24 @@ class App(tk.Tk):
                                 self.currently_snapped_widget.configure(highlightbackground="#0b4073", highlightthickness=3)
                         except: pass
                         self.currently_snapped_widget = None
+
+                    # 5c. Executa Free-Move (Lógica de estabilidade de 1.5s)
+                    now = time.time()
+                    gaze_point = (final_gaze_x, final_gaze_y)
+                    
+                    if self.last_gaze_pos is None:
+                        self.last_gaze_pos = gaze_point
+                        self.last_stable_time = now
+
+                    dist = ((gaze_point[0] - self.last_gaze_pos[0]) ** 2 + (
+                                gaze_point[1] - self.last_gaze_pos[1]) ** 2) ** 0.5
+
+                    if dist > GAZE_TOLERANCE_PX: # Movimento significativo
+                        self.last_gaze_pos = gaze_point
+                        self.last_stable_time = now
+                    elif now - self.last_stable_time >= GAZE_STABILITY_DELAY: # Olhar estável por 1.5s
+                        pyautogui.moveTo(gaze_point[0], gaze_point[1], duration=0.1)
+                        self.last_cursor_pos = gaze_point
 
         # Reagenda o loop
         self._update_loop_job = self.after(50, self.update_loop)
@@ -1039,6 +1174,7 @@ class App(tk.Tk):
             self._clear_root()
             if self.tracker:
                 self.tracker.stop()
+            pygame.quit()
         finally:
             self.destroy()
 

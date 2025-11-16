@@ -165,34 +165,46 @@ class NotepadFrame(tk.Frame):
                     self.controller.caps_btn_ref = btn
 
     def _on_key_press(self, key_char):
-        """Lida com cliques do teclado, atualizando o estado do controller."""
+        """Lida com cliques do teclado, atualizando o estado do controller e tocando o som."""
 
         widget = self.controller.notepad_text_widget
         if not widget:
             return
 
+        # 1. PROCESSAMENTO DA TECLA (COMO ANTES)
+        action_performed = False
+
         if key_char == 'Backspace':
             widget.delete(tk.INSERT + "-1c", tk.INSERT)
+            action_performed = True
         elif key_char == 'Enter':
             widget.insert(tk.INSERT, '\n')
+            action_performed = True
         elif key_char == 'Tab':
             widget.insert(tk.INSERT, '\t')
+            action_performed = True
         elif key_char == 'Space':
             widget.insert(tk.INSERT, ' ')
-
+            action_performed = True
+        
         elif key_char == 'Shift':
+            # Lógica do Shift (sem som de tecla, pois é um toggle)
             self.controller.sticky_shift_active = not self.controller.sticky_shift_active
             new_color = "#1E88E5" if self.controller.sticky_shift_active else "#CCCCCC"
             if hasattr(self.controller, "shift_btn_ref"):
-                self.controller.shift_btn_ref.configure(bg=new_color, highlightbackground=new_color) # Atualiza ambos
+                self.controller.shift_btn_ref.configure(bg=new_color, highlightbackground=new_color)
+            action_performed = True 
 
         elif key_char == 'Caps':
+            # Lógica do Caps (sem som de tecla, pois é um toggle)
             self.controller.caps_lock_active = not self.controller.caps_lock_active
             new_color = "#1E88E5" if self.controller.caps_lock_active else "#CCCCCC"
             if hasattr(self.controller, "caps_btn_ref"):
-                self.controller.caps_btn_ref.configure(bg=new_color, highlightbackground=new_color) # Atualiza ambos
+                self.controller.caps_btn_ref.configure(bg=new_color, highlightbackground=new_color)
+            action_performed = True 
 
         else:
+            # Lógica de inserção de caractere
             char_to_insert = key_char
             is_letter = key_char.isalpha() and len(key_char) == 1
             is_upper = self.controller.caps_lock_active ^ self.controller.sticky_shift_active
@@ -201,11 +213,20 @@ class NotepadFrame(tk.Frame):
                 char_to_insert = key_char.upper() if is_upper else key_char.lower()
 
             widget.insert(tk.INSERT, char_to_insert)
-
+            
+            # Desativa Sticky Shift após a inserção de um caractere
             if self.controller.sticky_shift_active:
                 self.controller.sticky_shift_active = False
                 if hasattr(self.controller, "shift_btn_ref"):
-                    self.controller.shift_btn_ref.configure(bg="#CCCCCC", highlightbackground="#CCCCCC") # Atualiza ambos
+                    self.controller.shift_btn_ref.configure(bg="#CCCCCC", highlightbackground="#CCCCCC")
+            
+            action_performed = True
+
+
+        # 2. AUDIO (NOVO BLOCO)
+        if action_performed:
+            self.controller.play_sound('key')
+        # FIM DO NOVO BLOCO
 
         widget.focus_set()
         widget.event_generate("<<Modified>>")

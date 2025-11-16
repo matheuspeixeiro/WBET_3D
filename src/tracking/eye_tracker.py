@@ -1,3 +1,6 @@
+# src/tracking/eye_tracker.py
+# VERSÃO ATUALIZADA: Suporta calibração não-bloqueante (controlada pelo main.py)
+
 import threading
 import time
 from datetime import datetime
@@ -13,18 +16,19 @@ class EyeTracker(threading.Thread):
     RIGHT_IRIS_INDEXES = [469, 470, 471, 472]
     LEFT_EYE_OUTLINE_IDX = [362, 385, 387, 263, 390, 373]
     RIGHT_EYE_OUTLINE_IDX = [133, 160, 158, 33, 153, 144]
-
-    EAR_THRESHOLD = 0.2
+    EAR_THRESHOLD = 0.30
 
     def __init__(self, camera_index: int = 0, shared_state: dict = None):
         super().__init__(daemon=True, name="EyeTrackerThread")
         self.camera_index = camera_index
         self.shared_state = shared_state or {}
-        self.lock = self.shared_state.get("_lock", threading.Lock())
+        self.lock = self.shared_state.get("_lock", threading.RLock())
         self.running = False
         self.cap = None
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = None
+        
+        # Estado de calibração
         self.left_locked = False
         self.right_locked = False
         self.left_sphere_local_offset = None
@@ -34,6 +38,12 @@ class EyeTracker(threading.Thread):
         self.R_ref_nose = [None]
         self.base_radius = 20
         self.loaded_profile_name = None
+
+        # --- NOVOS: Flags de controle de calibração ---
+        self._trigger_calib_step_c = False
+        self._trigger_calib_step_s = False
+        self._latest_frame = None
+        self._face_detected_in_frame = False
 
     def _compute_iris_center(self, landmarks, indexes):
         points = np.array([[landmarks[i].x * mc.w, landmarks[i].y * mc.h, landmarks[i].z * mc.w] for i in indexes])
@@ -50,17 +60,16 @@ class EyeTracker(threading.Thread):
             return 0.4
 
     def run(self):
+        """Loop principal da thread: processa frames, calibra e rastreia."""
         self.face_mesh = self.mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True)
-        if not self.cap or not self.cap.isOpened():
-            self.cap = cv2.VideoCapture(self.camera_index)
+        self.cap = cv2.VideoCapture(self.camera_index)
         
-        if not self.cap.isOpened():
+        if not self.cap or not self.cap.isOpened():
             print(f"ERRO: Não foi possível abrir a câmera índice {self.camera_index}")
             self.running = False
             return
             
         mc.w, mc.h = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
         self.running = True
         last_valid_gaze = None
 
@@ -70,179 +79,120 @@ class EyeTracker(threading.Thread):
                 time.sleep(0.005)
                 continue
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = self.face_mesh.process(rgb)
-            gaze_is_valid = False
-
-            # --- DADOS PADRÃO PARA O SHARED_STATE ---
-            current_is_blinking = False
-            current_is_boosting = False # <-- NOVO (FASE 4)
-
-            if results.multi_face_landmarks:
-                landmarks = results.multi_face_landmarks[0].landmark
-                head_center, R_final, nose_points_3d = mc.compute_and_draw_coordinate_box(
-                    frame, landmarks, mc.nose_indices, self.R_ref_nose
-                )
-
-                if self.left_locked and self.right_locked:
-                    iris_left_3d = self._compute_iris_center(landmarks, self.LEFT_IRIS_INDEXES)
-                    iris_right_3d = self._compute_iris_center(landmarks, self.RIGHT_IRIS_INDEXES)
-
-                    current_nose_scale = mc.compute_scale(nose_points_3d)
-                    scale_ratio_l = current_nose_scale / self.left_calibration_nose_scale
-                    scale_ratio_r = current_nose_scale / self.right_calibration_nose_scale
-
-                    sphere_world_l = head_center + R_final @ (self.left_sphere_local_offset * scale_ratio_l)
-                    sphere_world_r = head_center + R_final @ (self.right_sphere_local_offset * scale_ratio_r)
-
-                    left_dir = mc._normalize(iris_left_3d - sphere_world_l)
-                    right_dir = mc._normalize(iris_right_3d - sphere_world_r)
-                    combined_dir = mc._normalize((left_dir + right_dir) / 2.0)
-
-                    mc.combined_gaze_directions.append(combined_dir)
-                    avg_gaze_dir = mc._normalize(np.mean(mc.combined_gaze_directions, axis=0))
-
-                    screen_x, screen_y, raw_yaw, raw_pitch = mc.convert_gaze_to_screen_coordinates(
-                        avg_gaze_dir, mc.calibration_offset_yaw, mc.calibration_offset_pitch
-                    )
-                    last_valid_gaze = (screen_x, screen_y, raw_yaw, raw_pitch, 1.0)
-                    gaze_is_valid = True
-
-                # --- LÓGICA DE PISCADA ATUALIZADA (FASES 3 e 4) ---
-                left_ear = self._compute_ear(landmarks, self.LEFT_EYE_OUTLINE_IDX)
-                right_ear = self._compute_ear(landmarks, self.RIGHT_EYE_OUTLINE_IDX)
-                
-                is_left_blinking = left_ear < self.EAR_THRESHOLD
-                is_right_blinking = right_ear < self.EAR_THRESHOLD
-
-                # Fase 3: Clique = AMBOS os olhos fechados
-                current_is_blinking = is_left_blinking and is_right_blinking
-                
-                # Fase 4: Boost = SÓ o olho direito fechado
-                current_is_boosting = is_right_blinking and (not is_left_blinking)
-                # --- FIM DA LÓGICA DE PISCADA ---
-
-            # --- ATUALIZA O ESTADO COMPARTILHADO ---
+            # Salva o frame para o preview da UI
             with self.lock:
-                if gaze_is_valid:
-                    self.shared_state["gaze"] = last_valid_gaze
-                
-                self.shared_state["is_blinking"] = current_is_blinking
-                self.shared_state["is_boosting"] = current_is_boosting # <-- NOVO
-
-            time.sleep(0.001)
-
-        self.stop()
-
-    def start_debug_window(self, window_pos=None):
-        """Abre a janela de debug (OpenCV) e permite calibrar. Fecha com 'q'."""
-        if not self.cap or not self.cap.isOpened():
-            self.cap = cv2.VideoCapture(self.camera_index)
-        mc.w, mc.h = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.face_mesh = self.mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True)
-
-        print("[EyeTracker] Janela de debug aberta...")
-
-        win_name = "Head/Eye Debug"
-        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-        if window_pos and isinstance(window_pos, tuple) and len(window_pos) == 2:
-            try:
-                cv2.moveWindow(win_name, int(window_pos[0]), int(window_pos[1]))
-            except Exception:
-                pass
-
-        while True:
-            mc.update_orbit_from_keys()
-            ret, frame = self.cap.read()
-            if not ret:
-                break
+                self._latest_frame = frame.copy()
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = self.face_mesh.process(rgb)
-
-            head_center, R_final, all_landmarks_3d, combined_dir = None, None, None, None
-            sphere_world_l, sphere_world_r, iris_left_3d, iris_right_3d = None, None, None, None
-            scaled_radius_l, scaled_radius_r = None, None
+            
+            gaze_is_valid = False
+            current_is_blinking = False
+            current_is_boosting = False
 
             if results.multi_face_landmarks:
+                self._face_detected_in_frame = True
                 landmarks = results.multi_face_landmarks[0].landmark
-                all_landmarks_3d = np.array([[lm.x * mc.w, lm.y * mc.h, lm.z * mc.w] for lm in landmarks])
+                
+                # --- LÓGICA DE CALIBRAÇÃO (MOVIDA PARA CÁ) ---
+                # Esta lógica é necessária para os passos 'C' e 'S'
                 head_center, R_final, nose_points_3d = mc.compute_and_draw_coordinate_box(
                     frame, landmarks, mc.nose_indices, self.R_ref_nose
                 )
                 iris_left_3d = self._compute_iris_center(landmarks, self.LEFT_IRIS_INDEXES)
                 iris_right_3d = self._compute_iris_center(landmarks, self.RIGHT_IRIS_INDEXES)
 
-                if self.left_locked and self.right_locked:
-                    current_nose_scale = mc.compute_scale(nose_points_3d)
-                    scale_ratio_l = current_nose_scale / self.left_calibration_nose_scale
-                    scale_ratio_r = current_nose_scale / self.right_calibration_nose_scale
-
-                    sphere_world_l = head_center + R_final @ (self.left_sphere_local_offset * scale_ratio_l)
-                    sphere_world_r = head_center + R_final @ (self.right_sphere_local_offset * scale_ratio_r)
-                    scaled_radius_l = self.base_radius * scale_ratio_l
-                    scaled_radius_r = self.base_radius * scale_ratio_r
-
-                    left_dir = mc._normalize(iris_left_3d - sphere_world_l)
-                    right_dir = mc._normalize(iris_right_3d - sphere_world_r)
-                    combined_dir = mc._normalize((left_dir + right_dir) / 2.0)
-
-            debug_img = mc.render_debug_view_orbit(
-                mc.h, mc.w,
-                head_center3d=head_center,
-                sphere_world_l=sphere_world_l,
-                scaled_radius_l=scaled_radius_l,
-                sphere_world_r=sphere_world_r,
-                scaled_radius_r=scaled_radius_r,
-                iris3d_l=iris_left_3d,
-                iris3d_r=iris_right_3d,
-                left_locked=self.left_locked,
-                right_locked=self.right_locked,
-                landmarks3d=all_landmarks_3d,
-                combined_dir=combined_dir,
-                monitor_corners=mc.monitor_corners,
-                monitor_center=mc.monitor_center_w,
-                monitor_normal=mc.monitor_normal_w,
-                gaze_markers_arg=mc.gaze_markers
-            )
-
-            cv2.imshow(win_name, debug_img)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-
-            if results.multi_face_landmarks:
-                if key == ord('c'):
+                # --- DISPARADOR PARA O PASSO 'C' ---
+                if self._trigger_calib_step_c:
                     current_nose_scale = mc.compute_scale(nose_points_3d)
                     camera_dir_local = R_final.T @ np.array([0, 0, 1])
-
                     self.left_sphere_local_offset = R_final.T @ (iris_left_3d - head_center) + self.base_radius * camera_dir_local
                     self.right_sphere_local_offset = R_final.T @ (iris_right_3d - head_center) + self.base_radius * camera_dir_local
                     self.left_calibration_nose_scale = self.right_calibration_nose_scale = current_nose_scale
                     self.left_locked = self.right_locked = True
-
                     gaze_dir_hint = mc._normalize(iris_left_3d - (head_center + R_final @ self.left_sphere_local_offset))
                     mc.monitor_corners, mc.monitor_center_w, mc.monitor_normal_w, mc.units_per_cm = mc.create_monitor_plane(
                         head_center, R_final, landmarks, mc.w, mc.h, gaze_dir=gaze_dir_hint
                     )
-                    print("[Calibração] Plano do monitor criado e esferas oculares travadas.")
+                    print("[Calibração] Passo C: Plano do monitor criado e esferas oculares travadas.")
+                    self._trigger_calib_step_c = False # Reseta o flag
 
-                elif key == ord('s') and combined_dir is not None:
-                    _, _, raw_yaw, raw_pitch = mc.convert_gaze_to_screen_coordinates(combined_dir, 0.0, 0.0)
-                    mc.calibration_offset_yaw = -raw_yaw
-                    mc.calibration_offset_pitch = -raw_pitch
-                    print("[Calibração] Centro da tela calibrado.")
+                # A lógica de gaze só roda *depois* da calibração 'C'
+                if self.left_locked and self.right_locked:
+                    current_nose_scale = mc.compute_scale(nose_points_3d)
+                    scale_ratio_l = current_nose_scale / self.left_calibration_nose_scale
+                    scale_ratio_r = current_nose_scale / self.right_calibration_nose_scale
+                    sphere_world_l = head_center + R_final @ (self.left_sphere_local_offset * scale_ratio_l)
+                    sphere_world_r = head_center + R_final @ (self.right_sphere_local_offset * scale_ratio_r)
+                    left_dir = mc._normalize(iris_left_3d - sphere_world_l)
+                    right_dir = mc._normalize(iris_right_3d - sphere_world_r)
+                    combined_dir = mc._normalize((left_dir + right_dir) / 2.0)
 
-        cv2.destroyAllWindows()
-        if self.cap:
-            self.cap.release()
-            self.cap = None
+                    # --- DISPARADOR PARA O PASSO 'S' ---
+                    if self._trigger_calib_step_s:
+                        _, _, raw_yaw, raw_pitch = mc.convert_gaze_to_screen_coordinates(combined_dir, 0.0, 0.0)
+                        mc.calibration_offset_yaw = -raw_yaw
+                        mc.calibration_offset_pitch = -raw_pitch
+                        print("[Calibração] Passo S: Centro da tela calibrado.")
+                        self._trigger_calib_step_s = False # Reseta o flag
+                    
+                    # --- LÓGICA NORMAL DE GAZE ---
+                    mc.combined_gaze_directions.append(combined_dir)
+                    avg_gaze_dir = mc._normalize(np.mean(mc.combined_gaze_directions, axis=0))
+                    screen_x, screen_y, raw_yaw, raw_pitch = mc.convert_gaze_to_screen_coordinates(
+                        avg_gaze_dir, mc.calibration_offset_yaw, mc.calibration_offset_pitch
+                    )
+                    last_valid_gaze = (screen_x, screen_y, raw_yaw, raw_pitch, 1.0)
+                    gaze_is_valid = True
+
+                # --- LÓGICA DE PISCADA (SEMPRE RODA SE TIVER ROSTO) ---
+                left_ear = self._compute_ear(landmarks, self.LEFT_EYE_OUTLINE_IDX)
+                right_ear = self._compute_ear(landmarks, self.RIGHT_EYE_OUTLINE_IDX)
+                is_left_blinking = left_ear < self.EAR_THRESHOLD
+                is_right_blinking = right_ear < self.EAR_THRESHOLD
+                current_is_blinking = is_left_blinking and is_right_blinking
+                current_is_boosting = is_right_blinking and (not is_left_blinking)
+            
+            else:
+                self._face_detected_in_frame = False
+
+            # --- ATUALIZA O ESTADO COMPARTILHADO ---
+            with self.lock:
+                if gaze_is_valid:
+                    self.shared_state["gaze"] = last_valid_gaze
+                self.shared_state["is_blinking"] = current_is_blinking
+                self.shared_state["is_boosting"] = current_is_boosting
+
+            time.sleep(0.001)
+
+        self.stop() # Limpa o self.cap
+
+    # --- MÉTODO REMOVIDO ---
+    # start_debug_window(self, window_pos=None):
+    #     (Este método foi removido e sua lógica integrada ao run())
+
+    # --- NOVOS MÉTODOS DE CONTROLE ---
+    def get_latest_frame_and_status(self):
+        """Chamado pela UI (via main.py) para o preview da calibração."""
+        with self.lock:
+            frame = self._latest_frame.copy() if self._latest_frame is not None else None
+            face_detected = self._face_detected_in_frame
+        
+        if frame is not None:
+             # Converte BGR (do OpenCV) para RGB (do Tkinter/PIL)
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return frame, face_detected
+
+    def trigger_calibration_step(self, step: str):
+        """Chamado pelo main.py para disparar a calibração 'C' ou 'S'."""
+        if step == 'C':
+            self._trigger_calib_step_c = True
+        elif step == 'S':
+            self._trigger_calib_step_s = True
+    # --- FIM DOS NOVOS MÉTODOS ---
 
     def save_calibration(self):
-        """
-        Coleta todos os dados de calibração e os retorna como um dicionário
-        pronto para ser salvo como JSON (serialização recursiva).
-        """
+        # (Este método permanece o mesmo - com a correção do ndarray)
         if not (self.left_locked and self.right_locked):
             print("AVISO: Tentando salvar calibração sem estar calibrado.")
             return None
@@ -279,27 +229,23 @@ class EyeTracker(threading.Thread):
         return calib_data
 
     def load_calibration(self, calib_data: dict, profile_name: str = None):
-        """Carrega os dados de calibração de um dicionário."""
+        # (Este método permanece o mesmo)
         try:
             offsets = calib_data["calibration_offsets"]
             mc.calibration_offset_yaw = float(offsets["yaw"])
             mc.calibration_offset_pitch = float(offsets["pitch"])
-
             plane = calib_data["monitor_plane"]
             mc.monitor_corners = np.array(plane["corners"], dtype=float)
             mc.monitor_center_w = np.array(plane["center"], dtype=float)
             mc.monitor_normal_w = np.array(plane["normal"], dtype=float)
             mc.units_per_cm = float(plane["units_per_cm"])
-
             self.left_sphere_local_offset = np.array(calib_data["left_sphere_local_offset"], dtype=float)
             self.right_sphere_local_offset = np.array(calib_data["right_sphere_local_offset"], dtype=float)
             self.left_calibration_nose_scale = float(calib_data["left_calibration_nose_scale"])
             self.right_calibration_nose_scale = float(calib_data["right_calibration_nose_scale"])
             self.left_locked = self.right_locked = True
-
             if profile_name:
                 self.loaded_profile_name = profile_name
-
             print("Dados de calibração carregados com sucesso no tracker.")
             return True
         except Exception as e:
@@ -314,9 +260,11 @@ class EyeTracker(threading.Thread):
 
     def stop(self):
         self.running = False
+        time.sleep(0.05) # Dá tempo para a thread 'run' terminar
         try:
             if self.cap:
                 self.cap.release()
+                self.cap = None
         except Exception:
             pass
         try:

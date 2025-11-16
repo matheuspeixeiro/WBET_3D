@@ -388,7 +388,7 @@ def render_debug_view_orbit(
         for P in landmarks3d:
             res = project_point(P)
             if res is not None:
-                cv2.circle(debug, res[0], 0, (200, 200, 200), -1)
+                cv2.circle(debug, res[0], 2, (200, 200, 200), -1)
 
     # Head center cross
     draw_cross_3d(head_w, size=12, color=(255, 0, 255), thickness=2)
@@ -520,18 +520,18 @@ def render_debug_view_orbit(
 
     # Help text bottom-left (as in original)
     help_text = [
-        "C = calibrate screen center",
-        "J = yaw left",
-        "L = yaw right",
-        "I = pitch up",
-        "K = pitch down",
-        "[ = zoom out",
-        "] = zoom in",
-        "R = reset view",
-        "X = add marker",
-        "q = quit",
-        "F7 = toggle mouse control"
+        "C = Calcula Posicao dos Globos Oculares",
+        "S = Calibra o Olhar com o Centro da Tela",
+        "J = Guinada Esquerda",
+        "L = Guinada Direita",
+        "I = Arfagem Cima",
+        "K = Arfagem Baixo",
+        "[ = Zoom (-)",
+        "] = Zoom (+)",
+        "R = Resetar Visualizacao",
+        "Q = Sair"
     ]
+
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 0.5
     thickness = 1
