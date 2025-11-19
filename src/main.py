@@ -30,11 +30,11 @@ PREVIEW_SIZE = (320, 240)  # Usado pela tela de startup
 GAZE_MOVE_DELAY = 5
 GAZE_STABILITY_DELAY = 1.5
 GAZE_TOLERANCE_PX = 80
-SCAN_DELAY_SECONDS = 1.5  # Tempo de varredura (3 segundos)
+SCAN_DELAY_SECONDS = 1.1  # Tempo de varredura (3 segundos)
 # --- CONSTANTES FASE 4 (BOOST) ---
-SCAN_BOOST_DELAY_SECONDS = 0.3  # Velocidade do boost (100ms)
+SCAN_BOOST_DELAY_SECONDS = 0.2  # Velocidade do boost (100ms)
 SCAN_BOOST_PRE_TIMER_SECONDS = 1.5 # de olho direito fechado para ATIVAR
-SCAN_BOOST_STOP_TIMER_SECONDS = 1.0
+SCAN_BOOST_STOP_TIMER_SECONDS = 0.1
 SCAN_ESC_PRE_TIMER_SECONDS = 1.5
 # --- CONSTANTES DE AUDIO ---
 SOUND_DIR = "resources/sounds"
