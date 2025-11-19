@@ -199,6 +199,7 @@ class EyeTracker(threading.Thread):
                 current_is_blinking = is_left_blinking and is_right_blinking
                 # Boost: Direita fechada E Esquerda aberta
                 current_is_boosting = is_right_blinking and (not is_left_blinking)
+                current_is_escaping = is_left_blinking and (not is_right_blinking) # Só Esquerda (Esc)
             
             else:
                 self._face_detected_in_frame = False
@@ -209,6 +210,7 @@ class EyeTracker(threading.Thread):
                     self.shared_state["gaze"] = last_valid_gaze
                 self.shared_state["is_blinking"] = current_is_blinking
                 self.shared_state["is_boosting"] = current_is_boosting
+                self.shared_state["is_escaping"] = current_is_escaping
 
             time.sleep(0.001)
 

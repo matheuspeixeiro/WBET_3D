@@ -35,6 +35,7 @@ SCAN_DELAY_SECONDS = 1.5  # Tempo de varredura (3 segundos)
 SCAN_BOOST_DELAY_SECONDS = 0.3  # Velocidade do boost (100ms)
 SCAN_BOOST_PRE_TIMER_SECONDS = 1.5 # de olho direito fechado para ATIVAR
 SCAN_BOOST_STOP_TIMER_SECONDS = 1.0
+SCAN_ESC_PRE_TIMER_SECONDS = 1.5
 # --- CONSTANTES DE AUDIO ---
 SOUND_DIR = "resources/sounds"
 MOUSE_CLICK_SOUND = os.path.join(SOUND_DIR, "mouse_click.mp3")
@@ -89,7 +90,8 @@ class App(tk.Tk):
         self.is_boost_active = False          # Boost está ATIVO
         self.boost_pre_dwell_start_time = 0   # Timer de 3s do boost
         self.boost_stop_start_time = 0        # Timer para DESLIGAR
-        self.boost_needs_release = False     
+        self.boost_needs_release = False
+        self.escape_start_time = 0     
 
         # --- Estado de Clique (Substitui click_request) ---
         self.blink_state = "IDLE" # IDLE, PRE_LOCKED, LOCKED
@@ -859,13 +861,39 @@ class App(tk.Tk):
         # --- 1. Read States ---
         is_blinking = False
         is_boosting = False # Right-eye-only
+        is_escaping = False
         lock = self.shared_state.get("_lock")
         if lock:
             with lock:
                 is_blinking = self.shared_state.get("is_blinking", False)
                 is_boosting = self.shared_state.get("is_boosting", False)
+                is_escaping = self.shared_state.get("is_escaping", False)
         else:
             return # Sai se o lock não estiver disponível
+
+        if is_escaping:
+            # Se começou a piscar esquerdo, reseta as outras intenções para não conflitar
+            self.is_boost_pre_dwelling = False
+            self.boost_pre_dwell_start_time = 0
+            self.boost_stop_start_time = 0
+            self.blink_pre_dwell_start_time = 0
+            self.is_dwell_clicking = False
+
+            # Inicia timer do Escape
+            if self.escape_start_time == 0:
+                print("[Scanner] Iniciando timer ESCAPE (Esquerda)...")
+                self.escape_start_time = time.time()
+            
+            # Se segurou o tempo suficiente:
+            if (now - self.escape_start_time) >= SCAN_ESC_PRE_TIMER_SECONDS:
+                print("[Scanner] ESCAPE CONFIRMADO! Saindo do teclado.")
+                self.play_sound('key') # Som de confirmação
+                self._handle_scan_exit() # <--- Essa função já existe e libera o cursor
+                self.escape_start_time = 0 # Reseta
+                
+            return # Pára o processamento aqui
+        else:
+            self.escape_start_time = 0 # Reseta se abrir o olho
 
         # --- 2. Handle Click (Phase 3) - HIGHEST PRIORITY ---
         if is_blinking:
@@ -1049,15 +1077,24 @@ class App(tk.Tk):
                 if is_blinking:
                     self.blink_state = "PRE_LOCKED"
                     self.blink_start_time = time.time()
-                    # AQUI: Se for um widget snapável, move o mouse para o centro 
-                    # do snap AGORA para travar antes que o olhar se perca.
+                    # --- CORREÇÃO DE SEGURANÇA AQUI ---
+                    # Antes de mover o mouse, verificamos se o widget ainda existe
                     if self.currently_snapped_widget:
-                         widget = self.currently_snapped_widget
-                         pyautogui.moveTo(
-                            widget.winfo_rootx() + widget.winfo_width() / 2,
-                            widget.winfo_rooty() + widget.winfo_height() / 2,
-                            duration=0.05 # Move bem rápido
-                        )
+                         try:
+                             # Verifica se o widget é válido e existe na tela
+                             if self.currently_snapped_widget.winfo_exists():
+                                 widget = self.currently_snapped_widget
+                                 pyautogui.moveTo(
+                                    widget.winfo_rootx() + widget.winfo_width() / 2,
+                                    widget.winfo_rooty() + widget.winfo_height() / 2,
+                                    duration=0.05 
+                                )
+                             else:
+                                 # Se não existe mais (foi destruído), limpamos a referência
+                                 self.currently_snapped_widget = None
+                         except Exception:
+                             # Qualquer erro de acesso limpa a referência
+                             self.currently_snapped_widget = None
 
             elif self.blink_state == "PRE_LOCKED":
                 if not is_blinking: # Abriu os olhos: CANCELA
@@ -1080,23 +1117,36 @@ class App(tk.Tk):
                 self.play_sound('mouse') 
                 # ---------------------------
                 
-                # Executa ação
+                # --- LÓGICA DE ENTRADA NO TECLADO (NOVO) ---
+                if widget == self.keyboard_frame_widget:
+                    print("[Main] Clique no teclado detectado. Ativando SCANNER.")
+                    self.scan_mode_active = True
+                    self.currently_snapped_widget = None # Limpa o snap
+                    
+                    # Reseta estado do scanner
+                    self.scan_index = -1
+                    self.last_scan_time = time.time() - SCAN_DELAY_SECONDS
+                    
+                    # Remove a borda verde do frame do teclado (limpeza visual)
+                    try: widget.configure(highlightbackground="#0b4073", highlightthickness=0)
+                    except: pass
+
+                    self._update_loop_job = self.after(50, self.update_loop)
+                    return
+                # -------------------------------------------
+
+                # Executa ação normal (botões do dashboard, etc)
                 try:
-                    # Se for um widget Tkinter (dashboard, config)
                     widget.invoke()
                 except tk.TclError:
                     widget.focus_set()
                 except Exception as e:
-                    print(f"[EyeTracker] Erro no clique ocular (invoke): {e}")
+                    print(f"[EyeTracker] Erro no clique: {e}")
                 
-                if self.is_navigating:
-                    self._update_loop_job = self.after(50, self.update_loop)
-                    return
-                
+                # ... (Restante da lógica de clique mantida) ...
                 pyautogui.click()
-                self.just_clicked_time = time.time() # Congela por GAZE_MOVE_DELAY
-                self.blink_state = "IDLE" # Garante reset
-                
+                self.just_clicked_time = time.time()
+                self.blink_state = "IDLE"
                 self._update_loop_job = self.after(50, self.update_loop)
                 return
 
@@ -1144,25 +1194,6 @@ class App(tk.Tk):
                     if closest_widget != self.currently_snapped_widget:
                         was_snapped = True
 
-                        # Ativa o Modo de Varredura (se for o teclado)
-                        if closest_widget == self.keyboard_frame_widget:
-                            print("[Scanner] Gaze entrou no teclado. Ativando.")
-                            self.scan_mode_active = True
-                            self.currently_snapped_widget = None
-                            
-                            self.scan_index = -1 
-                            self.last_scan_time = time.time() - SCAN_DELAY_SECONDS
-                            
-                            try: 
-                                if isinstance(closest_widget, tk.Frame):
-                                    pass 
-                                else:
-                                    closest_widget.configure(highlightbackground="#0b4073", highlightthickness=3)
-                            except: pass
-                            
-                            self._update_loop_job = self.after(50, self.update_loop)
-                            return 
-                        
                         if closest_widget != self.currently_snapped_widget:
                             pyautogui.moveTo(
                                 closest_widget.winfo_rootx() + closest_widget.winfo_width() / 2,
@@ -1173,19 +1204,26 @@ class App(tk.Tk):
                             # Remove highlight antigo
                             if self.currently_snapped_widget and self.currently_snapped_widget.winfo_exists():
                                 try:
+                                    # Restaura cor original (ajuste conforme seu tema)
+                                    bg_color = "#0b4073" 
                                     if isinstance(self.currently_snapped_widget, tk.Text):
                                         self.currently_snapped_widget.configure(highlightbackground="white", highlightthickness=2)
                                     else:
-                                        self.currently_snapped_widget.configure(highlightbackground="#0b4073", highlightthickness=3)
+                                        self.currently_snapped_widget.configure(highlightbackground=bg_color, highlightthickness=0)
                                 except: pass
                             
                             # Adiciona highlight novo
                             if closest_widget.winfo_exists():
                                 try:
-                                    if isinstance(closest_widget, tk.Text):
+                                    # SE FOR O TECLADO: Borda Verde Grossa envolvendo tudo
+                                    if closest_widget == self.keyboard_frame_widget:
+                                        closest_widget.configure(highlightbackground="#00FF00", highlightthickness=6)
+                                    
+                                    # Outros widgets
+                                    elif isinstance(closest_widget, tk.Text):
                                         closest_widget.configure(highlightbackground="#00ff00", highlightthickness=4)
                                     else:
-                                        closest_widget.configure(highlightbackground="#00ff00", highlightthickness=6)
+                                        closest_widget.configure(highlightbackground="#00ff00", highlightthickness=4)
                                 except: pass
                                 
                             self.currently_snapped_widget = closest_widget
@@ -1195,10 +1233,12 @@ class App(tk.Tk):
                     # 5b. Remove highlight ao sair do foco
                     if self.currently_snapped_widget and self.currently_snapped_widget.winfo_exists():
                         try:
+                            bg_color = "#0b4073"
                             if isinstance(self.currently_snapped_widget, tk.Text):
                                 self.currently_snapped_widget.configure(highlightbackground="white", highlightthickness=2)
                             else:
-                                self.currently_snapped_widget.configure(highlightbackground="#0b4073", highlightthickness=3)
+                                # Remove destaque do teclado ou botões
+                                self.currently_snapped_widget.configure(highlightbackground=bg_color, highlightthickness=0)
                         except: pass
                         self.currently_snapped_widget = None
 
@@ -1248,6 +1288,7 @@ class App(tk.Tk):
         self.caps_lock_active = False
         self.focusable_widgets = []
         self.current_screen = None
+        self.currently_snapped_widget = None
         
         # Reseta o estado de varredura
         self.scan_mode_active = False
@@ -1261,6 +1302,7 @@ class App(tk.Tk):
         self.is_boost_pre_dwelling = False # <-- NOVO
         self.is_boost_active = False       # <-- NOVO
         self.boost_pre_dwell_start_time = 0 # <-- NOVO
+        self.escape_start_time = 0
         self.is_boost_pre_dwelling = False
         self.is_boost_active = False
         self.boost_pre_dwell_start_time = 0
