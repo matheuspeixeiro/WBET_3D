@@ -16,7 +16,7 @@ class EyeTracker(threading.Thread):
     RIGHT_IRIS_INDEXES = [469, 470, 471, 472]
     LEFT_EYE_OUTLINE_IDX = [362, 385, 387, 263, 390, 373]
     RIGHT_EYE_OUTLINE_IDX = [133, 160, 158, 33, 153, 144]
-    EAR_THRESHOLD = 0.30
+    #EAR_THRESHOLD = 0.30
 
     def __init__(self, camera_index: int = 0, shared_state: dict = None):
         super().__init__(daemon=True, name="EyeTrackerThread")
@@ -38,6 +38,32 @@ class EyeTracker(threading.Thread):
         self.R_ref_nose = [None]
         self.base_radius = 20
         self.loaded_profile_name = None
+
+        # --- NOVOS: Variáveis de Calibração de EAR ---
+        self.ear_threshold_left = 0.30  # Valor padrão inicial
+        self.ear_threshold_right = 0.30 # Valor padrão inicial
+        
+        # --- NOVOS: Variáveis de Calibração de EAR ---
+        self.ear_threshold_left = 0.30
+        self.ear_threshold_right = 0.30
+        
+        # Histórico para média (últimos 30 frames)
+        self.ear_history_left = []
+        self.ear_history_right = []
+        
+        # --- FLAGS DE CONTROLE SEPARADOS ---
+        self._calibrating_blink = False  # E2
+        self._calibrating_boost = False  # E3
+        
+        # --- VALORES CAPTURADOS ---
+        # Repouso (E1)
+        self._avg_open_left = 0.35
+        self._avg_open_right = 0.35
+        # Piscada Dupla (E2)
+        self._min_blink_left = 1.0
+        self._min_blink_right = 1.0
+        # Boost/Wink (E3)
+        self._min_boost_right = 1.0
 
         # --- NOVOS: Flags de controle de calibração ---
         self._trigger_calib_step_c = False
@@ -93,6 +119,27 @@ class EyeTracker(threading.Thread):
             if results.multi_face_landmarks:
                 self._face_detected_in_frame = True
                 landmarks = results.multi_face_landmarks[0].landmark
+
+                # --- 1. CALCULO DE EAR ---
+                left_ear = self._compute_ear(landmarks, self.LEFT_EYE_OUTLINE_IDX)
+                right_ear = self._compute_ear(landmarks, self.RIGHT_EYE_OUTLINE_IDX)
+
+                # Atualiza buffer (para passo E1 - Repouso)
+                self.ear_history_left.append(left_ear)
+                self.ear_history_right.append(right_ear)
+                if len(self.ear_history_left) > 30: self.ear_history_left.pop(0)
+                if len(self.ear_history_right) > 30: self.ear_history_right.pop(0)
+
+                # --- 2. CAPTURA DE DADOS DE CALIBRAÇÃO ---
+                
+                # Passo E2: Capturando Piscada Dupla (Clique)
+                if self._calibrating_blink:
+                    if left_ear < self._min_blink_left: self._min_blink_left = left_ear
+                    if right_ear < self._min_blink_right: self._min_blink_right = right_ear
+                
+                # Passo E3: Capturando Boost (Wink Direito)
+                if self._calibrating_boost:
+                    if right_ear < self._min_boost_right: self._min_boost_right = right_ear
                 
                 # --- LÓGICA DE CALIBRAÇÃO (MOVIDA PARA CÁ) ---
                 # Esta lógica é necessária para os passos 'C' e 'S'
@@ -145,12 +192,12 @@ class EyeTracker(threading.Thread):
                     last_valid_gaze = (screen_x, screen_y, raw_yaw, raw_pitch, 1.0)
                     gaze_is_valid = True
 
-                # --- LÓGICA DE PISCADA (SEMPRE RODA SE TIVER ROSTO) ---
-                left_ear = self._compute_ear(landmarks, self.LEFT_EYE_OUTLINE_IDX)
-                right_ear = self._compute_ear(landmarks, self.RIGHT_EYE_OUTLINE_IDX)
-                is_left_blinking = left_ear < self.EAR_THRESHOLD
-                is_right_blinking = right_ear < self.EAR_THRESHOLD
+                # --- 3. DETECÇÃO COM LIMIARES DINÂMICOS ---
+                is_left_blinking = left_ear < self.ear_threshold_left
+                is_right_blinking = right_ear < self.ear_threshold_right
+                
                 current_is_blinking = is_left_blinking and is_right_blinking
+                # Boost: Direita fechada E Esquerda aberta
                 current_is_boosting = is_right_blinking and (not is_left_blinking)
             
             else:
@@ -170,6 +217,90 @@ class EyeTracker(threading.Thread):
     # --- MÉTODO REMOVIDO ---
     # start_debug_window(self, window_pos=None):
     #     (Este método foi removido e sua lógica integrada ao run())
+
+    # --- NOVOS MÉTODOS DE CALIBRAÇÃO DE EAR ---
+
+    def calibrate_step_open(self):
+        """E1: Registra o estado de repouso (olhos abertos)."""
+        if self.ear_history_left:
+            self._avg_open_left = sum(self.ear_history_left) / len(self.ear_history_left)
+            self._avg_open_right = sum(self.ear_history_right) / len(self.ear_history_right)
+            print(f"[EAR] Repouso -> L:{self._avg_open_left:.3f} R:{self._avg_open_right:.3f}")
+            return True
+        return False
+
+    def calibrate_ears_step_open(self):
+        """Passo 1: Captura a média dos olhos abertos (repouso)."""
+        if self.ear_history_left:
+            self._captured_avg_open_left = sum(self.ear_history_left) / len(self.ear_history_left)
+            self._captured_avg_open_right = sum(self.ear_history_right) / len(self.ear_history_right)
+            print(f"[EAR Calib] Aberto Médio -> L: {self._captured_avg_open_left:.3f}, R: {self._captured_avg_open_right:.3f}")
+            return True
+        return False
+
+    def start_blink_capture(self):
+        """Inicia captura E2 (Piscada Dupla)."""
+        self._min_blink_left = 1.0
+        self._min_blink_right = 1.0
+        self._calibrating_blink = True
+
+    def stop_blink_capture(self):
+        self._calibrating_blink = False
+        print(f"[EAR] Blink Mínimos -> L:{self._min_blink_left:.3f} R:{self._min_blink_right:.3f}")
+
+    def start_boost_capture(self):
+        """Inicia captura E3 (Piscada Direita / Boost)."""
+        self._min_boost_right = 1.0
+        self._calibrating_boost = True
+
+    def stop_boost_capture(self):
+        self._calibrating_boost = False
+        print(f"[EAR] Boost Mínimo -> R:{self._min_boost_right:.3f}")
+        self._finalize_thresholds()
+
+    def _finalize_thresholds(self):
+        """Calcula os limiares finais combinando as 3 etapas."""
+        
+        # Limiar Esquerdo: Média entre Aberto e Fechado (Blink)
+        thresh_l = (self._avg_open_left + self._min_blink_left) / 2
+        
+        # Limiar Direito: Precisamos ser cuidadosos aqui.
+        # O olho direito fecha tanto no Blink quanto no Boost.
+        # Pegamos o "pior caso" (o valor mais baixo registrado em qualquer uma das ações)
+        # para garantir que o limiar detecte ambos.
+        min_right_total = min(self._min_blink_right, self._min_boost_right)
+        thresh_r = (self._avg_open_right + min_right_total) / 2
+        
+        # Travas de segurança (Clamps)
+        # Impede que o limiar fique impossível (ex: < 0.12) ou muito sensível (ex: > 0.40)
+        self.ear_threshold_left = max(0.12, min(0.40, thresh_l))
+        self.ear_threshold_right = max(0.12, min(0.40, thresh_r))
+        
+        print(f"[EAR] FINAIS -> L:{self.ear_threshold_left:.3f} R:{self.ear_threshold_right:.3f}")
+
+    def start_ear_action_capture(self):
+        """Inicia a gravação dos valores mínimos (usuário vai piscar/winkar)."""
+        self._captured_min_left = 1.0
+        self._captured_min_right = 1.0
+        self._calibrating_ears = True
+
+    def stop_ear_action_capture(self):
+        """Finaliza gravação e calcula os limiares finais."""
+        self._calibrating_ears = False
+        
+        # Cálculo: Média entre o estado aberto e o estado mais fechado registrado
+        # Adicionamos um pequeno 'padding' de segurança (ex: 0.02) para não ficar sensível demais
+        margin = 0.0
+        
+        thresh_l = (self._captured_avg_open_left + self._captured_min_left) / 2 - margin
+        thresh_r = (self._captured_avg_open_right + self._captured_min_right) / 2 - margin
+        
+        # Proteção contra valores absurdos
+        self.ear_threshold_left = max(0.10, min(0.45, thresh_l))
+        self.ear_threshold_right = max(0.10, min(0.45, thresh_r))
+        
+        print(f"[EAR Calib] Minimos -> L: {self._captured_min_left:.3f}, R: {self._captured_min_right:.3f}")
+        print(f"[EAR Calib] NOVOS LIMIARES -> L: {self.ear_threshold_left:.3f}, R: {self.ear_threshold_right:.3f}")
 
     # --- NOVOS MÉTODOS DE CONTROLE ---
     def get_latest_frame_and_status(self):
@@ -215,6 +346,10 @@ class EyeTracker(threading.Thread):
                 "yaw": mc.calibration_offset_yaw,
                 "pitch": mc.calibration_offset_pitch
             },
+            "ear_thresholds": {
+                "left": self.ear_threshold_left,
+                "right": self.ear_threshold_right
+            },
             "monitor_plane": to_list_safe({
                 "corners": mc.monitor_corners,
                 "center": mc.monitor_center_w,
@@ -247,6 +382,11 @@ class EyeTracker(threading.Thread):
             if profile_name:
                 self.loaded_profile_name = profile_name
             print("Dados de calibração carregados com sucesso no tracker.")
+
+            ear_data = calib_data.get("ear_thresholds", {})
+            self.ear_threshold_left = float(ear_data.get("left", 0.30))
+            self.ear_threshold_right = float(ear_data.get("right", 0.30))
+
             return True
         except Exception as e:
             print(f"ERRO ao carregar dados de calibração: {e}")

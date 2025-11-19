@@ -30,10 +30,11 @@ PREVIEW_SIZE = (320, 240)  # Usado pela tela de startup
 GAZE_MOVE_DELAY = 5
 GAZE_STABILITY_DELAY = 1.5
 GAZE_TOLERANCE_PX = 80
-SCAN_DELAY_SECONDS = 3.0  # Tempo de varredura (3 segundos)
+SCAN_DELAY_SECONDS = 1.5  # Tempo de varredura (3 segundos)
 # --- CONSTANTES FASE 4 (BOOST) ---
-SCAN_BOOST_DELAY_SECONDS = 0.5  # Velocidade do boost (100ms)
-SCAN_BOOST_PRE_TIMER_SECONDS = 3.0 # 3s de olho fechado para ATIVAR
+SCAN_BOOST_DELAY_SECONDS = 0.3  # Velocidade do boost (100ms)
+SCAN_BOOST_PRE_TIMER_SECONDS = 1.5 # de olho direito fechado para ATIVAR
+SCAN_BOOST_STOP_TIMER_SECONDS = 1.0
 # --- CONSTANTES DE AUDIO ---
 SOUND_DIR = "resources/sounds"
 MOUSE_CLICK_SOUND = os.path.join(SOUND_DIR, "mouse_click.mp3")
@@ -87,6 +88,8 @@ class App(tk.Tk):
         self.is_boost_pre_dwelling = False    # Timer de 3s do boost
         self.is_boost_active = False          # Boost está ATIVO
         self.boost_pre_dwell_start_time = 0   # Timer de 3s do boost
+        self.boost_stop_start_time = 0        # Timer para DESLIGAR
+        self.boost_needs_release = False     
 
         # --- Estado de Clique (Substitui click_request) ---
         self.blink_state = "IDLE" # IDLE, PRE_LOCKED, LOCKED
@@ -497,38 +500,107 @@ class App(tk.Tk):
         return None, False
     
     def update_calib_ui(self, face_detected, instruction_label, action_button):
-        """Controla o estado da UI de calibração (botões e texto)."""
+        """Atualiza texto da UI baseado no passo atual."""
         if not face_detected:
-            instruction_label.config(text="Rosto não detectado.\nPosicione-se de frente para a câmera.")
+            instruction_label.config(text="Rosto não detectado.")
             action_button.config(state="disabled", text="...")
             return
 
+        # Passos Geométricos (Existentes)
         if self.calib_step == "C":
-            instruction_label.config(text="Olhe fixamente para o '+' no centro da tela e clique no botão abaixo.")
-            action_button.config(text="1. Fixar Posição dos Olhos", state="normal")
+            instruction_label.config(text="1. Olhe para o '+' central e clique.")
+            action_button.config(text="1. Fixar Geometria", state="normal")
+
         elif self.calib_step == "S":
-            instruction_label.config(text="Continue olhando para o '+' e clique no botão para finalizar a calibração.")
-            action_button.config(text="2. Calibrar Centro da Tela", state="normal")
+            instruction_label.config(text="2. Continue olhando para o '+' e clique.")
+            action_button.config(text="2. Calibrar Tela", state="normal")
+        
+        # --- NOVOS PASSOS EAR ---
+        
+        elif self.calib_step == "E1":
+            instruction_label.config(text="3. Mantenha os olhos ABERTOS e RELAXADOS.\nNão pisque e clique no botão.")
+            action_button.config(text="3. Registrar Repouso", state="normal")
+        
+        elif self.calib_step == "E2":
+            instruction_label.config(text="4. Ao clicar em 'Gravar', feche OS DOIS OLHOS (Piscada Longa) por 3 segundos.")
+            action_button.config(text="4. Gravar Clique (3s)", state="normal")
+            
+        elif self.calib_step == "E2_WAIT":
+            instruction_label.config(text="MANTENHA OS OLHOS FECHADOS...\n(Calibrando Clique...)")
+            action_button.config(text="Gravando...", state="disabled")
+
+        elif self.calib_step == "E3":
+            instruction_label.config(text="5. Ao clicar em 'Gravar', feche APENAS O OLHO DIREITO (Wink) por 3 segundos.")
+            action_button.config(text="5. Gravar Boost (3s)", state="normal")
+
+        elif self.calib_step == "E3_WAIT":
+            instruction_label.config(text="MANTENHA SÓ O DIREITO FECHADO...\n(Calibrando Boost...)")
+            action_button.config(text="Gravando...", state="disabled")
+
         elif self.calib_step == "DONE":
-             instruction_label.config(text="Calibração concluída! Salvando perfil...")
-             action_button.config(text="Concluído", state="disabled")
+             instruction_label.config(text="Calibração Total Concluída!")
+             action_button.config(text="Salvar e Sair", state="disabled")
 
     def on_calib_button_click(self):
-        """Chamado quando o botão principal da tela de calibração é clicado."""
-        if not self.tracker:
-            return
+        if not self.tracker: return
 
+        # Passos C e S (Mantidos)
         if self.calib_step == "C":
             self.tracker.trigger_calibration_step('C')
-            self.calib_step = "S" # Avança para o próximo passo
+            self.calib_step = "S"
         
         elif self.calib_step == "S":
             self.tracker.trigger_calibration_step('S')
-            self.calib_step = "DONE" # Finaliza
+            self.calib_step = "E1" # Vai para EAR
             
-            # Espera 1 segundo para o usuário ler "Concluído"
-            self.after(1000, self.finish_calibration)
+        # --- FLUXO EAR SEPARADO ---
+        
+        elif self.calib_step == "E1":
+            # Registra Repouso Instantâneo
+            if self.tracker.calibrate_step_open():
+                self.calib_step = "E2"
+            else:
+                print("Erro: Histórico EAR vazio.")
+
+        elif self.calib_step == "E2":
+            # Inicia Gravação Piscada (3s)
+            self.tracker.start_blink_capture()
+            self.calib_step = "E2_WAIT"
+            # Agenda o fim da captura
+            self.after(3500, self._finish_blink_calibration) 
+
+        elif self.calib_step == "E3":
+            # Inicia Gravação Boost (3s)
+            self.tracker.start_boost_capture()
+            self.calib_step = "E3_WAIT"
+            # Agenda o fim da captura
+            self.after(3500, self._finish_boost_calibration)
     
+    def _finish_blink_calibration(self):
+        """Finaliza E2 e avança para E3."""
+        if self.tracker:
+            self.tracker.stop_blink_capture()
+            self.play_sound('key') # Feedback sonoro
+        self.calib_step = "E3"
+
+    def _finish_boost_calibration(self):
+        """Finaliza E3 e conclui."""
+        if self.tracker:
+            self.tracker.stop_boost_capture() # Calcula thresholds finais aqui
+            self.play_sound('key')
+        
+        self.calib_step = "DONE"
+        # Espera 1.5s para o usuário ler "Concluído" e fecha
+        self.after(1500, self.finish_calibration)
+
+    def _finish_ear_calibration(self):
+        """Finaliza a gravação de EAR após o timer."""
+        if self.tracker:
+            self.tracker.stop_ear_action_capture()
+        
+        self.calib_step = "DONE"
+        self.after(1000, self.finish_calibration)
+
     def finish_calibration(self):
         """Salva os dados e navega para o dashboard."""
         if not self.tracker:
@@ -587,6 +659,16 @@ class App(tk.Tk):
 
         self.wait_window(dialog)
         return result["value"]
+
+    def _finish_boost_calibration(self):
+        """Finaliza E3 e conclui."""
+        if self.tracker:
+            self.tracker.stop_boost_capture() # Aqui ele já calcula os thresholds finais
+            self.play_sound('key')
+        
+        self.calib_step = "DONE"
+        # Espera um pouco para o usuário ler e fecha
+        self.after(1500, self.finish_calibration)
 
     # --------- Lógica do Bloco de Notas (Controller) ----------
 
@@ -787,10 +869,10 @@ class App(tk.Tk):
 
         # --- 2. Handle Click (Phase 3) - HIGHEST PRIORITY ---
         if is_blinking:
-            # Reseta o boost se o usuário piscar com os dois olhos
+            # Se piscar com os DOIS olhos, reseta intenções de boost mas MANTÉM o estado ativo
             self.is_boost_pre_dwelling = False
-            self.is_boost_active = False
             self.boost_pre_dwell_start_time = 0
+            self.boost_stop_start_time = 0
             
             # Inicia o pré-timer (0.7s)
             if self.blink_pre_dwell_start_time == 0:
@@ -826,33 +908,50 @@ class App(tk.Tk):
         current_scan_delay = SCAN_DELAY_SECONDS # Default to slow
         
         if is_boosting:
-            # Reseta timers de clique
-            self.blink_pre_dwell_start_time = 0
-            self.is_dwell_clicking = False
-            
-            # Start pre-dwell timer for boost (3s)
-            if not self.is_boost_pre_dwelling:
-                print(f"[Scanner] Boost detectado. Iniciando timer de {SCAN_BOOST_PRE_TIMER_SECONDS}s...")
-                self.is_boost_pre_dwelling = True
-                self.boost_pre_dwell_start_time = time.time()
-            
-            # Check if pre-dwell is complete
-            if (now - self.boost_pre_dwell_start_time) >= SCAN_BOOST_PRE_TIMER_SECONDS:
-                self.is_boost_active = True
-            
-            if self.is_boost_active:
-                current_scan_delay = SCAN_BOOST_DELAY_SECONDS # Set to fast
+            if not self.boost_needs_release:
                 
-        else: # Olhos abertos (nem piscando, nem boost)
-            # Reseta todos os timers
+                # CENÁRIO A: Boost está DESLIGADO -> Vamos LIGAR (Requer 3s)
+                if not self.is_boost_active:
+                    if not self.is_boost_pre_dwelling:
+                        print(f"[Scanner] Iniciando timer para ATIVAR Boost...")
+                        self.is_boost_pre_dwelling = True
+                        self.boost_pre_dwell_start_time = time.time()
+                    
+                    elif (now - self.boost_pre_dwell_start_time) >= SCAN_BOOST_PRE_TIMER_SECONDS:
+                        self.is_boost_active = True
+                        self.boost_needs_release = True # Trava para obrigar reabertura
+                        self.is_boost_pre_dwelling = False # Limpa flag
+                        print("[Scanner] BOOST ATIVADO (Modo Rápido)")
+                        self.play_sound('key') # Feedback sonoro de ativação
+
+                # CENÁRIO B: Boost está LIGADO -> Vamos DESLIGAR (Requer 1s)
+                else:
+                    if self.boost_stop_start_time == 0:
+                        print(f"[Scanner] Iniciando timer para DESATIVAR Boost...")
+                        self.boost_stop_start_time = time.time()
+                    
+                    elif (now - self.boost_stop_start_time) >= SCAN_BOOST_STOP_TIMER_SECONDS:
+                        self.is_boost_active = False
+                        self.boost_needs_release = True # Trava para obrigar reabertura
+                        self.boost_stop_start_time = 0 # Limpa timer
+                        print("[Scanner] BOOST DESATIVADO (Modo Normal)")
+                        self.play_sound('key') # Feedback sonoro de desativação
+                
+        else: 
+            # Olhos abertos (ou piscada incompleta)
+            # Reseta os timers de tentativa, mas NÃO o estado self.is_boost_active
+            self.is_boost_pre_dwelling = False
+            self.boost_pre_dwell_start_time = 0
+            self.boost_stop_start_time = 0
+            
+            # Destrava o sistema, permitindo uma nova ação de boost/stop
+            self.boost_needs_release = False
+            
+            # Reseta timers de clique também
             self.blink_pre_dwell_start_time = 0
             self.is_dwell_clicking = False
-            if self.is_boost_pre_dwelling or self.is_boost_active:
-                 print("[Scanner] Boost desativado.")
-            self.is_boost_pre_dwelling = False
-            self.is_boost_active = False
-            self.boost_pre_dwell_start_time = 0
-            current_scan_delay = SCAN_DELAY_SECONDS # Garante que está lento
+
+        current_scan_delay = SCAN_BOOST_DELAY_SECONDS if self.is_boost_active else SCAN_DELAY_SECONDS
 
         # --- 4. Handle Scan (Phase 2) - LAST PRIORITY ---
         if (now - self.last_scan_time) >= current_scan_delay:
@@ -886,6 +985,7 @@ class App(tk.Tk):
             if 0 <= self.scan_index < len(self.scan_key_list):
                 try:
                     new_key = self.scan_key_list[self.scan_index]
+                    color = "#00ffff" if self.is_boost_active else self.HIGHLIGHT_BG
                     new_key.configure(
                         highlightbackground=self.HIGHLIGHT_BG, 
                         highlightthickness=self.HIGHLIGHT_THICKNESS
@@ -1161,6 +1261,11 @@ class App(tk.Tk):
         self.is_boost_pre_dwelling = False # <-- NOVO
         self.is_boost_active = False       # <-- NOVO
         self.boost_pre_dwell_start_time = 0 # <-- NOVO
+        self.is_boost_pre_dwelling = False
+        self.is_boost_active = False
+        self.boost_pre_dwell_start_time = 0
+        self.boost_stop_start_time = 0
+        self.boost_needs_release = False
         
         # Reseta o estado de clique do dashboard
         self.blink_state = "IDLE"
